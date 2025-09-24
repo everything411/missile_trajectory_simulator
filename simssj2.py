@@ -79,6 +79,7 @@ class Simulation(object):
         mtot += self.payload
 
         ##### FIN DATA
+        global fh, sa, CTm, CRm, TFm, finnum
         fh = self.FinHeight # this is S(m)
         sa = self.SweepAngle # Angle in degrees
         CTm = self.FinTipChordLength # CT[m]
@@ -87,7 +88,6 @@ class Simulation(object):
         finnum = self.FinsNumber # number
         #numfin = self.FinsChoice # number of fins
         
-        global fh, sa, CTm, CRm, TFm, finnum
         #print "FH=",fh,sa,CTm,CRm,TFm, finnum
 
 
@@ -98,24 +98,24 @@ class Simulation(object):
 
         if self.numstages == 1:
            VBO = self.Isp0[1]*9.81*log(mtot/(mtot - self.fuelmass[1]))
-           print VBO
+           print (VBO)
         if self.numstages ==2:
            VBO = self.Isp0[1]*9.81*log(mtot/(mtot - self.fuelmass[1]))
            VBO = VBO + self.Isp0[2]*9.81*log((mtot-self.m0[1])/(mtot - self.m0[1] - self.fuelmass[2]))
-           print VBO
+           print (VBO)
         if self.numstages ==3:
            VBO = 0.
            VBO = self.Isp0[1]*9.81*log(mtot/(mtot - self.fuelmass[1]))
            VBO = VBO + self.Isp0[2]*9.81*log((mtot-self.m0[1])/(mtot - self.m0[1] - self.fuelmass[2]))
            VBO = VBO + self.Isp0[3]*9.81*log((mtot-self.m0[1]-self.m0[2])/(mtot -self.m0[1] -self.m0[2] - self.fuelmass[3]))
-           print VBO
+           print (VBO)
         if self.numstages ==4:
            VBO = 0.
            VBO = self.Isp0[1]*9.81*log(mtot/(mtot - self.fuelmass[1]))
            VBO = VBO + self.Isp0[2]*9.81*log((mtot-self.m0[1])/(mtot - self.m0[1] - self.fuelmass[2]))
            VBO = VBO + self.Isp0[3]*9.81*log((mtot-self.m0[1]-self.m0[2])/(mtot -self.m0[1] -self.m0[2] - self.fuelmass[3]))
            VBO = VBO + self.Isp0[4]*9.81*log((mtot-self.m0[1]-self.m0[2]-self.m0[3])/(mtot -self.m0[1] -self.m0[2] - self.m0[3]-self.fuelmass[4]))
-           print VBO
+           print (VBO)
         if self.numstages ==5:
            VBO = 0.
            VBO = self.Isp0[1]*9.81*log(mtot/(mtot - self.fuelmass[1]))
@@ -123,7 +123,7 @@ class Simulation(object):
            VBO = VBO + self.Isp0[3]*9.81*log((mtot-self.m0[1]-self.m0[2])/(mtot -self.m0[1] -self.m0[2] - self.fuelmass[3]))
            VBO = VBO + self.Isp0[4]*9.81*log((mtot-self.m0[1]-self.m0[2]-self.m0[3])/(mtot -self.m0[1] -self.m0[2] - self.m0[3]-self.fuelmass[4]))
            VBO = VBO + self.Isp0[5]*9.81*log((mtot-self.m0[1]-self.m0[2]-self.m0[3]-self.m0[4])/(mtot -self.m0[1] -self.m0[2] - self.m0[3]-self.m0[4]-self.fuelmass[5]))
-           print 'VBO=',VBO/1000.
+           print ('VBO=',VBO/1000.)
         # Now no need to estimate the range anymore and can remove est range button
         ##### INTEGRATE
         #   
@@ -131,7 +131,7 @@ class Simulation(object):
         deltat = deltatinit
         flagdeltat = True
         m = mtot
-        print 'm=mtot',m
+        print ('m=mtot',m)
 
         #
         #print 'dmdt=',self.dMdt[1]
@@ -141,7 +141,8 @@ class Simulation(object):
         tlimit = self.burntime[1] # ditto
         nstage = 1  # used at burnout of stages
         gamma_half = gamma # angle of missile or RV w/ local horizon
-        
+        global opt_burnout_angle
+
         if self.trajectory == 'Minimum Energy':
            #set burnout angle to optimum for MET
            #uses Wheelon's form of the equations
@@ -285,7 +286,6 @@ class Simulation(object):
             if t <= vertical_flight_period:
                 dgamma_half = 0.0
             elif (t > vertical_flight_period) and (t <= burntimetot):
-                global opt_burnout_angle
                 dgamma_half = ((opt_burnout_angle - pi/2)/(burntimetot - vertical_flight_period))
             else:
                 #use Wright's equation, hopefully not too disjoint with previous
@@ -304,11 +304,11 @@ class Simulation(object):
             if (t + deltat / 5) > tlimit and flag == True:
                 if __name__ == "__main__":
                     #Simple text printout
-                    print "Stage %i burnout" % nstage
-                    print "Velocity (km/s): ",v/1000
-                    print "Angle (deg h): ",gamma*180/pi
-                    print "Range (km): ",Rearth*psi/1000
-                    print "Time (sec): ",t
+                    print ("Stage %i burnout" % nstage)
+                    print ("Velocity (km/s): ",v/1000)
+                    print ("Angle (deg h): ",gamma*180/pi)
+                    print ("Range (km): ",Rearth*psi/1000)
+                    print ("Time (sec): ",t)
                 else:
                     #GUI printout
                     app.Results.StageVelocityResult[nstage].SetValue("%4.2f" % float(v/1000))
@@ -320,13 +320,13 @@ class Simulation(object):
                 # m = mtot - self.m0[nstage]
                 if nstage == 1:
                     m = mtot - self.m0[1]
-                    print 'NSTAGE=',nstage, m
+                    print ('NSTAGE=',nstage, m)
                 if nstage == 2:
                     m = mtot - self.m0[1] - self.m0[2]
-                    print 'NSTAGE=',nstage, m                    
+                    print ('NSTAGE=',nstage, m)                    
                 if nstage == 3:
                     m = mtot - self.m0[1] - self.m0[2] - self.m0[3]
-                    print 'NSTAGE=',nstage, m                    
+                    print ('NSTAGE=',nstage, m)                    
                 m_old = m
 
 
@@ -344,7 +344,7 @@ class Simulation(object):
 
         if t >= tEND:
             if __name__ == "__main__":
-                print "Simulation exceeded time limit."
+                print ("Simulation exceeded time limit.")
             else:
                 dlg = wx.MessageDialog(self.parent,"Exceeded time limit, results are likely invalid.","Simulation error",wx.OK | wx.ICON_INFORMATION)
                 dlg.ShowModal()
@@ -354,9 +354,9 @@ class Simulation(object):
         #print "Done"
         if __name__ == "__main__":
             #print final results
-            print "Range (km): ",psi*Rearth/1000
-            print "Apogee (km): ",apogee/1000
-            print "Time to target (sec): ",t
+            print ("Range (km): ",psi*Rearth/1000)
+            print ("Apogee (km): ",apogee/1000)
+            print ("Time to target (sec): ",t)
         else:
             #put results in frame
             app.Results.ApogeeResult.SetValue("%4.2f" % float(apogee/1000))
@@ -664,9 +664,10 @@ class Simulation(object):
         return degree * pi/180
         
 if __name__ == "__main__":
-    print "the simulation object"
-    print "using simple text interface, minimum energy trajectory"
-    print ""
+    print ("the simulation object")
+    print ("using simple text interface, minimum energy trajectory")
+    print ("")
+    raw_input = input
     sim = Simulation(None) #this simulation object has no parent
     sim.numstages = int(raw_input("Number of stages: "))
     sim.numfins = int(raw_input("Number of fins: "))
@@ -697,10 +698,10 @@ if __name__ == "__main__":
         sim.FinThickness = float(raw_input("Fin Thickness [m]: "))*1
         #
 
-    print '\n'
+    print ('\n')
     sim.trajectory = "Minimum Energy"
     results = sim.integrate(sim.trajectory)
-    print '\n'
+    print ('\n')
     
     path = 'data.txt'
     outfile = open(path,'w')
@@ -731,8 +732,8 @@ if __name__ == "__main__":
             outfile.write('%.3f' % flat[i][n])
             outfile.write(',')
         outfile.write('\n')
-    print "Data written to '%s'" % path
-    self.outfile.close()
+    print ("Data written to '%s'" % path)
+    outfile.close()
 
 else:
     import wx

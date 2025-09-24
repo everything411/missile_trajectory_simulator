@@ -31,7 +31,7 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 #required modules
 import wx, wx.adv
-from plot import * #made wx.lib.plot local
+from wx.lib.plot import * #made wx.lib.plot local
 try:
     import numarray as numpy
 except ImportError:
@@ -341,7 +341,7 @@ class ParamsPanel(wx.Panel):
             #used when loading numfins from preset, SetValue doesn't call event handler
         else:
             numfins = int(event.GetString())
-            print "NUMFINS=",numfins
+            print ("NUMFINS=",numfins)
             if numfins !=0:
                 #self.StageSizer.Show(self.FinsNumberText)
 
@@ -400,7 +400,7 @@ class ParamsPanel(wx.Panel):
             #used when loading numstages from preset, SetValue doesn't call event handler
         else:
             numstages = int(event.GetString())
-            print "NUMSTAGES=",numstages
+            print ("NUMSTAGES=",numstages)
         #show requested stages
         for i in range(1,numstages+1):
             self.StageSizer.Show(self.StageNumberText[i])
@@ -529,7 +529,7 @@ class ParamsPanel(wx.Panel):
 				
 				
             sim.numstages = int(self.StageChoiceBox.GetSelection()+1)
-            print 'sim.numstages =',sim.numstages
+            print ('sim.numstages =',sim.numstages)
             #because choices[0]=1
 
             for i in range(1,sim.numstages+1):
@@ -564,7 +564,7 @@ class ParamsPanel(wx.Panel):
                 other.StageResultSizer.Show(other.StageHeightResult[i])
                 other.StageResultSizer.Show(other.StageRangeResult[i])
                 other.StageResultSizer.Show(other.StageTimeResult[i])
-                other.StageResultSizer.Show(other.StageMachResult[i])
+                # other.StageResultSizer.Show(other.StageMachResult[i])
 				
             """ #hide unused stages in Results panel
             for i in range(sim.numstages+0,6):
@@ -726,7 +726,7 @@ class ResultsPanel(wx.Panel):
         #print "Show Plot: %s vs %s" %(y,x)
         try:
             self.frame.Show(False) #hide previous
-        except wx._core.PyDeadObjectError:
+        except RuntimeError:
             #window has been closed by user, recreate
             self.frame = PlotFrame(None,-1,"Results Plot")
         self.frame.canvas.Reset() #clear previous
@@ -763,7 +763,7 @@ class ResultsPanel(wx.Panel):
             x_data = self.data[x] #in seconds
             x = x + ' (sec)'
         elif x == "Velocity":
-		    x_data = self.data[x] 
+            x_data = self.data[x] 
         if y == "Drag":
             y_data = self.data[y] #in N
             y = y + ' (N)'
@@ -793,14 +793,14 @@ class ResultsPanel(wx.Panel):
                t = 131.21 + .00299*h
             t = t + 273.15 #convert to kelvin
             a = sqrt(1.4*287*t) 
-            global x_data # note added this to not have the UnboundLocalError: https://eli.thegreenplace.net/2011/05/15/understanding-unboundlocalerror-in-python/
+            # global x_data # note added this to not have the UnboundLocalError: https://eli.thegreenplace.net/2011/05/15/understanding-unboundlocalerror-in-python/
             # and I removed the def temperature(h) function since this is the same code. 
             x_data = self.data["Velocity"]/a
         else:
             y_data = self.data[y] #for others, don't add units
         
         #plot trajectory line
-        line = numpy.array(zip(x_data,y_data))
+        line = numpy.array(list(zip(x_data,y_data)))
         plot.append(PolyLine(line,legend=x,colour='red'))
         
         self.frame.canvas.Draw(PlotGraphics(plot,title,x,y))
