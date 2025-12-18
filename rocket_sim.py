@@ -3,7 +3,33 @@ import numpy as np
 from numba import njit
 import csv
 from dataclasses import dataclass, field
-from typing import List, Dict, Tuple, Optional
+from typing import List, Dict
+import matplotlib.pyplot as plt
+
+OBJ_TYPE_ROCKET = 0  # 主火箭
+OBJ_TYPE_STAGE = 1  # 废弃级
+OBJ_TYPE_SAT = 2  # 卫星/载荷
+
+
+@dataclass
+class TrackedObject:
+    name: str
+    obj_type: int
+    state: np.ndarray  # [rx, ry, rz, vx, vy, vz, m]
+
+    # 物理属性
+    drag_area: float
+    drag_coeff_type: int  # 0=Active, 1=Fixed
+    fixed_cd: float = 0.5  # 碎片默认阻力系数
+
+    # 动力学属性
+    stage_matrix: np.ndarray = field(
+        default_factory=lambda: np.zeros((0, 4))
+    )  # [thrust, dmdt, t_s, t_e]
+
+    # 历史记录
+    history: List[Dict] = field(default_factory=list)
+    active: bool = True
 
 
 @dataclass
@@ -434,7 +460,6 @@ def calculate_gravity_numba(r_vec: np.ndarray) -> np.ndarray:
     return np.array([gx, gy, gz])
 
 
-
 @njit(cache=True)
 def physics_kernel(
     t: float,
@@ -585,24 +610,31 @@ class RocketSimulator3D:
     def __init__(self, config: SimConfig):
         self.cfg = config
         self.time = 0.0
-        self.state_history = []
+        self.objects: List[TrackedObject] = []
 
-        # --- Precompute Arrays for Numba ---
-        # 1. Stages: [thrust, dmdt, t_start, t_end]
+        # --- 1. 预计算主火箭推力矩阵 ---
         stages_list = []
         acc_t = 0.0
-        for s in self.cfg.stages:
+        self.stage_timings = []  # [(t_end, dry_mass, index)]
+        num_stages = len(self.cfg.stages)  # 获取总级数
+
+        for i, s in enumerate(self.cfg.stages):
             t_start = acc_t
             t_end = acc_t + s.burn_time
             stages_list.append([s.thrust, s.dmdt, t_start, t_end])
+
+            # 最后一级应在“载荷分离”事件中处理
+            if i < num_stages - 1:
+                self.stage_timings.append((t_end, s.dry_mass, i))
             acc_t = t_end
 
-        self.stage_matrix = np.array(stages_list, dtype=np.float64)
-        self.stage_timings = [
-            (row[2], row[3]) for row in stages_list
-        ]  # For separation logic
+        self.main_stage_matrix = np.array(stages_list, dtype=np.float64)
 
-        # 2. Fins: [number, height, root, tip, sweep, thick]
+        # 卫星分离时间 (默认为末级关机后 2秒)
+        self.payload_sep_time = acc_t + 2.0
+        self.payload_separated = False
+
+        # --- 2. 预计算气动数据 ---
         f = self.cfg.fins
         self.fin_data = np.array(
             [
@@ -616,7 +648,6 @@ class RocketSimulator3D:
             dtype=np.float64,
         )
 
-        # 3. Geometry & Guidance
         self.geo_params = np.array(
             [
                 self.cfg.launch_azimuth,
@@ -635,134 +666,313 @@ class RocketSimulator3D:
 
         self.nc_type_id = get_nc_type_id(self.cfg.nosecone_type)
 
-        # Init State
+        # --- 3. 初始化主火箭对象 ---
         r0, v0 = self._get_initial_state()
         m0 = (
             sum(s.fuel_mass + s.dry_mass for s in self.cfg.stages)
             + self.cfg.payload_mass
         )
-        self.current_state = np.concatenate((r0, v0, [m0]))
+
+        main_rocket = TrackedObject(
+            name="Main Rocket",
+            obj_type=OBJ_TYPE_ROCKET,
+            state=np.concatenate((r0, v0, [m0])),
+            drag_area=np.pi * (self.cfg.rocket_diameter / 2) ** 2,
+            drag_coeff_type=0,  # 动态计算 Cd
+            stage_matrix=self.main_stage_matrix,
+        )
+        self.objects.append(main_rocket)
 
     def _get_initial_state(self):
-        # 使用 Numba 版本的工具函数
         r_ecef = lla_to_ecef_numba(self.cfg.launch_lat, self.cfg.launch_lon, 5.0)
-        r_eci = r_ecef
         omega_vec = np.array([0, 0, OMEGA_E])
-        v_rot = np.cross(omega_vec, r_eci)
-        return r_eci, v_rot
+        v_rot = np.cross(omega_vec, r_ecef)
+        return r_ecef, v_rot
 
-    def _calculate_derivatives(self, t: float, state: np.ndarray) -> np.ndarray:
-        # 只是一个 Wrapper，调用编译好的 Kernel
+    def _calculate_derivatives(
+        self, t: float, current_state: np.ndarray, obj: TrackedObject
+    ) -> np.ndarray:
+        # 如果是主火箭，使用全功能物理核心
+        if obj.obj_type == OBJ_TYPE_ROCKET:
+            return physics_kernel(
+                t,
+                current_state,
+                obj.stage_matrix,
+                self.fin_data,
+                self.geo_params,
+                self.guidance_params,
+                self.nc_type_id,
+            )
+
+        # --- 碎片/卫星 物理核心 ---
+        # 构造空推力矩阵
+        empty_thrust = np.zeros((0, 4), dtype=np.float64)
+        # 估算等效直径
+        eff_diam = 2 * np.sqrt(obj.drag_area / np.pi)
+        # 被动制导参数 [vert_time, pitch, aoa] -> 全部无效化，进入无控弹道
+        passive_guidance = np.array([-1.0, 0.0, 0.0], dtype=np.float64)
+        # 几何参数：仅直径生效
+        passive_geo = np.array([0.0, eff_diam, 0.0, eff_diam, 1.0], dtype=np.float64)
+        # 无尾翼
+        no_fins = np.zeros(6, dtype=np.float64)
+
         return physics_kernel(
             t,
-            state,
-            self.stage_matrix,
-            self.fin_data,
-            self.geo_params,
-            self.guidance_params,
-            self.nc_type_id,
+            current_state,
+            empty_thrust,
+            no_fins,
+            passive_geo,
+            passive_guidance,
+            NC_TYPE_UNKNOWN,
         )
 
     def run(self, dt: float = 0.05):
-        """主循环"""
-        print(f"Starting 3D Simulation with dt={dt}s...")
+        print(f"Starting Multi-Body Simulation with dt={dt}s...")
 
-        self._record_state()
+        # 初始记录
+        self._record_all_states()
 
-        while True:
+        running = True
+        while running:
             t = self.time
-            state_vec = self.current_state
 
-            # --- 1. 撞地检测 ---
-            rx, ry, rz = state_vec[0:3]
-            # 简单的距离判断作为第一道防线
-            r_mag = math.sqrt(rx**2 + ry**2 + rz**2)
-
-            # 精确的椭球判断
-            is_underground = (
-                (rx**2 + ry**2) / R_EARTH**2 + (rz**2) / R_POLAR**2
-            ) < 0.999999
-
-            if t > 1.0 and is_underground:
-                print(
-                    f"Impact detected at t={t:.2f}s, Velocity={np.linalg.norm(state_vec[3:6]):.1f} m/s"
-                )
+            # 检查是否有物体还在飞行
+            active_count = sum(1 for o in self.objects if o.active)
+            if active_count == 0 or t > 20000:  # 超时保护
+                print("Simulation finished.")
                 break
 
-            if t > 10000:
-                print("Timeout reached.")
-                break
+            # --- 1. 遍历所有物体进行积分 ---
+            for obj in self.objects:
+                if not obj.active:
+                    continue
 
-            # --- 3. RK4 积分 ---
-            try:
-                k1 = self._calculate_derivatives(t, state_vec)
-                k2 = self._calculate_derivatives(t + dt / 2, state_vec + dt * k1 / 2)
-                k3 = self._calculate_derivatives(t + dt / 2, state_vec + dt * k2 / 2)
-                k4 = self._calculate_derivatives(t + dt, state_vec + dt * k3)
+                state_vec = obj.state
 
-                y_next = state_vec + (dt / 6) * (k1 + 2 * k2 + 2 * k3 + k4)
+                # 撞地检测
+                rx, ry, rz = state_vec[0:3]
+                if t > 5.0:  # 发射后几秒再检测
+                    dist_sq = (rx**2 + ry**2) / R_EARTH**2 + (rz**2) / R_POLAR**2
+                    if dist_sq < 0.999995:  # 稍微小于1以容忍误差
+                        print(f"[{obj.name}] Impacted Earth at t={t:.2f}s")
+                        obj.active = False
+                        continue
 
-            except Exception as e:
-                print(f"Integration error at t={t:.2f}: {e}")
-                break
-
-            # --- 4. 级间分离逻辑 ---
-            for i, (t_s, t_e) in enumerate(self.stage_timings):
-                # 检测是否刚刚跨越了分离时间点
-                if t < t_e and (t + dt) >= t_e:
-                    dry_mass = self.cfg.stages[i].dry_mass
-                    print(
-                        f"Event: Stage {i+1} Separation at t={t:.2f}s. Dropping Dry Mass: {dry_mass}kg"
+                # RK4 积分
+                try:
+                    # 获取当前状态的副本作为起点
+                    y_curr = state_vec
+                    k1 = self._calculate_derivatives(t, y_curr, obj)
+                    k2 = self._calculate_derivatives(
+                        t + dt / 2, y_curr + (dt / 2) * k1, obj
                     )
-                    y_next[6] -= dry_mass
+                    k3 = self._calculate_derivatives(
+                        t + dt / 2, y_curr + (dt / 2) * k2, obj
+                    )
+                    k4 = self._calculate_derivatives(t + dt, y_curr + dt * k3, obj)
+                    obj.state = y_curr + (dt / 6) * (k1 + 2 * k2 + 2 * k3 + k4)
+
+                except Exception as e:
+                    print(f"Error integrating {obj.name}: {e}")
+
+            # --- 2. 事件检测 (仅针对主火箭) ---
+            main_rocket = next(
+                (o for o in self.objects if o.obj_type == OBJ_TYPE_ROCKET and o.active),
+                None,
+            )
+
+            if main_rocket:
+                # A. 级间分离逻辑
+                # 使用一个新的列表来存储“尚未发生”的事件
+                remaining_timings = []
+
+                for sep_event in self.stage_timings:
+                    sep_time, dry_mass, idx = sep_event
+                    if t >= sep_time:
+                        print(
+                            f"Event: Stage {idx+1} Separation at t={t:.2f}s. Dropping mass: {dry_mass}kg"
+                        )
+
+                        # 1. 主火箭减重
+                        main_rocket.state[6] -= dry_mass
+                        # 2. 生成废弃级对象
+                        stage_name = f"Stage {idx+1} Body"
+                        self._spawn_debris(
+                            main_rocket, dry_mass, stage_name, OBJ_TYPE_STAGE
+                        )
+                    else:
+                        # 时间未到，保留该事件
+                        remaining_timings.append(sep_event)
+
+                # 更新列表，去掉已触发的事件
+                self.stage_timings = remaining_timings
+                # B. 卫星/载荷分离逻辑
+                if not self.payload_separated and t >= self.payload_sep_time:
+                    print(f"Event: Payload Separation at t={t:.2f}s")
+                    self.payload_separated = True
+                    # 此时主火箭包含: 末级干重 + 载荷
+                    total_m = main_rocket.state[6]
+                    payload_m = self.cfg.payload_mass
+                    # 剩下的就是末级干重
+                    upper_stage_m = total_m - payload_m
+
+                    # 1. 生成卫星对象 (先生成卫星，带走 payload_m)
+                    self._spawn_debris(
+                        main_rocket, payload_m, "Satellite", OBJ_TYPE_SAT
+                    )
+
+                    main_rocket.name = "Upper Stage Body"
+                    main_rocket.obj_type = OBJ_TYPE_STAGE
+                    main_rocket.state[6] = upper_stage_m
+
+                    # 增加阻力面积以模拟翻滚
+                    main_rocket.drag_area = main_rocket.drag_area * 4.0
 
             self.time += dt
-            self.current_state = y_next
+            self._record_all_states()
 
-            # if int(self.time * 10) % 5 == 0:
-            self._record_state()
+    def _spawn_debris(
+        self, parent_obj: TrackedObject, mass: float, name: str, o_type: int
+    ):
+        new_state = parent_obj.state.copy()
+        new_state[6] = mass
 
-        print(f"Simulation ended at t={self.time:.2f}s")
+        if o_type == OBJ_TYPE_SAT:
+            area = 1.5
+        else:
+            area = parent_obj.drag_area * 4.0
 
-    def _record_state(self):
-        r = self.current_state[0:3]
-        v = self.current_state[3:6]
-        m = self.current_state[6]
-
-        lat, lon, alt = eci_to_lla_numba(r, self.time)
-
-        # 计算相对速度用于 Mach
-        omega_vec = np.array([0, 0, OMEGA_E])
-        v_rel = v - np.cross(omega_vec, r)
-        v_mag = np.linalg.norm(v_rel)
-
-        # 简单的射程计算 (大圆距离)
-        r0 = lla_to_ecef_numba(self.cfg.launch_lat, self.cfg.launch_lon, 0)
-        curr_ecef = lla_to_ecef_numba(lat, lon, 0)
-        # 弧长近似
-        cos_val = np.dot(r0, curr_ecef) / (np.linalg.norm(r0) * np.linalg.norm(curr_ecef))
-        cos_val = np.clip(cos_val, -1, 1)
-        angle = np.arccos(cos_val)
-        downrange = angle * R_EARTH
-
-        self.state_history.append(
-            {
-                "Time": self.time,
-                "Altitude": alt,
-                "Downrange": downrange,
-                "Velocity": v_mag,
-                "Mass": m,
-                "Latitude": lat,
-                "Longitude": lon,
-            }
+        new_obj = TrackedObject(
+            name=name,
+            obj_type=o_type,
+            state=new_state,
+            drag_area=area,
+            drag_coeff_type=1,  # 固定 Cd
         )
+        self.objects.append(new_obj)
 
-    def export_csv(self, filename: str):
-        if not self.state_history:
-            return
-        keys = self.state_history[0].keys()
-        with open(filename, "w", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=keys)
-            writer.writeheader()
-            writer.writerows(self.state_history)
-        print(f"Data exported to {filename}")
+    def _record_all_states(self):
+        # 遍历所有物体并记录
+        for obj in self.objects:
+            if not obj.active:
+                continue
+
+            r = obj.state[0:3]
+            v = obj.state[3:6]
+            m = obj.state[6]
+
+            lat, lon, alt = eci_to_lla_numba(r, self.time)
+
+            # --- 速度计算 ---
+            omega_vec = np.array([0, 0, OMEGA_E])
+            v_rel = v - np.cross(omega_vec, r)
+            v_mag_rel = np.linalg.norm(v_rel)  # 相对地表速度 (用于气动)
+            v_mag_inertial = np.linalg.norm(v)
+            r_mag = np.linalg.norm(r)
+
+            if r_mag > 0:
+                spec_energy = 0.5 * v_mag_inertial**2 - GM / r_mag
+            else:
+                spec_energy = -np.inf
+
+            total_energy = spec_energy * m
+
+            # --- 射程计算 ---
+            r0 = lla_to_ecef_numba(self.cfg.launch_lat, self.cfg.launch_lon, 0)
+            curr_ecef = lla_to_ecef_numba(lat, lon, 0)
+
+            n_r0 = np.linalg.norm(r0)
+            n_curr = np.linalg.norm(curr_ecef)
+
+            if n_r0 > 1 and n_curr > 1:
+                cos_val = np.dot(r0, curr_ecef) / (n_r0 * n_curr)
+                cos_val = np.clip(cos_val, -1.0, 1.0)
+                angle = np.arccos(cos_val)
+                downrange = angle * R_EARTH
+            else:
+                downrange = 0.0
+
+            # 记录数据
+            obj.history.append(
+                {
+                    "Time": round(self.time, 3),
+                    "Object": obj.name,
+                    "Type": obj.obj_type,
+                    "Downrange": downrange,
+                    "Altitude": alt,
+                    "Velocity": v_mag_rel,
+                    "InertialVelocity": v_mag_inertial,
+                    "SpecificEnergy": spec_energy,
+                    "TotalEnergy": total_energy,
+                    "Mass": m,
+                    "Latitude": lat,
+                    "Longitude": lon,
+                }
+            )
+
+    def export_csv(self):
+        # 按物体名称分组导出
+        for obj in self.objects:
+            if not obj.history:
+                continue
+
+            # 清理文件名
+            safe_name = "".join([c if c.isalnum() else "_" for c in obj.name])
+            filename = f"trace_{safe_name}.csv"
+
+            keys = obj.history[0].keys()
+            try:
+                with open(filename, "w", newline="") as f:
+                    writer = csv.DictWriter(f, fieldnames=keys)
+                    writer.writeheader()
+                    writer.writerows(obj.history)
+                print(f"Exported data for '{obj.name}' to {filename}")
+            except Exception as e:
+                print(f"Failed to export {obj.name}: {e}")
+
+    def plot(self):
+        fig = plt.figure(figsize=(14, 6))
+
+        # 图1: 高度 vs 时间
+        ax1 = fig.add_subplot(1, 2, 1)
+        for obj in self.objects:
+            if not obj.history:
+                continue
+            times = [h["Time"] for h in obj.history]
+            alts = [h["Altitude"] / 1000 for h in obj.history]  # km
+            ax1.plot(times, alts, label=obj.name)
+
+        ax1.set_xlabel("Time (s)")
+        ax1.set_ylabel("Altitude (km)")
+        ax1.set_title("Altitude Profile")
+        ax1.legend()
+        ax1.grid(True)
+
+        # 图2: 3D 轨迹 (ECEF) - 简单示意
+        ax2 = fig.add_subplot(1, 2, 2, projection="3d")
+        # 画个地球
+        u, v = np.mgrid[0 : 2 * np.pi : 20j, 0 : np.pi : 10j]
+        x = R_EARTH / 1000 * np.cos(u) * np.sin(v)
+        y = R_EARTH / 1000 * np.sin(u) * np.sin(v)
+        z = R_EARTH / 1000 * np.cos(v)
+        ax2.plot_wireframe(x, y, z, color="gray", alpha=0.3)
+
+        for obj in self.objects:
+            # 抽样画图，防止卡顿
+            hist = obj.history[::10]
+            lats = np.radians([h["Latitude"] for h in hist])
+            lons = np.radians([h["Longitude"] for h in hist])
+            alts = np.array([h["Altitude"] for h in hist])
+
+            # 简易 LLA 转直角坐标画图
+            r = (R_EARTH + alts) / 1000
+            X = r * np.cos(lats) * np.cos(lons)
+            Y = r * np.cos(lats) * np.sin(lons)
+            Z = r * np.sin(lats)
+
+            ax2.plot(X, Y, Z, label=obj.name)
+
+        ax2.set_title("3D Trajectory (ECEF-ish)")
+
+        plt.tight_layout()
+        plt.show()
