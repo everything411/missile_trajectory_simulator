@@ -1,91 +1,24 @@
-import math
+# SPDX-License-Identifier: MIT
+
 import numpy as np
 from numba import njit
 import csv
 from dataclasses import dataclass, field
-from typing import List, Dict
+from typing import List, Dict, Optional
 import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
 
+# 对象类型
 OBJ_TYPE_ROCKET = 0  # 主火箭
 OBJ_TYPE_STAGE = 1  # 废弃级
 OBJ_TYPE_SAT = 2  # 卫星/载荷
 
+# 动力模式
+GUIDANCE_MODE_LAUNCH = 0.0  # 发射模式 (垂直 -> 程序转弯 -> 重力转弯)
+GUIDANCE_MODE_PROGRADE = 1.0  # 顺向模式 (始终对准速度方向，用于变轨)
+GUIDANCE_MODE_PASSIVE = -1.0  # 自由运动，无升力
 
-@dataclass
-class TrackedObject:
-    name: str
-    obj_type: int
-    state: np.ndarray  # [rx, ry, rz, vx, vy, vz, m]
-
-    # 物理属性
-    drag_area: float
-    drag_coeff_type: int  # 0=Active, 1=Fixed
-    fixed_cd: float = 0.5  # 碎片默认阻力系数
-
-    # 动力学属性
-    stage_matrix: np.ndarray = field(
-        default_factory=lambda: np.zeros((0, 4))
-    )  # [thrust, dmdt, t_s, t_e]
-
-    # 历史记录
-    history: List[Dict] = field(default_factory=list)
-    active: bool = True
-
-
-@dataclass
-class FinConfig:
-    number: int = 0
-    height: float = 0.0
-    root_chord: float = 0.0
-    tip_chord: float = 0.0
-    sweep_angle: float = 0.0
-    thickness: float = 0.0
-
-
-@dataclass
-class RocketStage:
-    fuel_mass: float  # kg
-    dry_mass: float  # kg
-    isp: float  # s
-    thrust: float  # N (Sea Level / Nominal)
-    burn_time: float = 0.0
-    dmdt: float = 0.0
-
-    def __post_init__(self):
-        # 自动计算派生属性
-        if self.thrust > 0 and self.isp > 0:
-            self.dmdt = self.thrust / (self.isp * 9.80665)
-            self.burn_time = self.fuel_mass / self.dmdt
-        else:
-            self.dmdt = 0
-            self.burn_time = 0
-
-
-@dataclass
-class SimConfig:
-    stages: List[RocketStage]
-    payload_mass: float
-    rocket_diameter: float
-    nozzle_area: float
-    nosecone_type: str = "Conical"
-    nosecone_ld_ratio: float = 3.0
-    reentry_diameter: float = 0.0
-    fins: FinConfig = field(default_factory=FinConfig)
-
-    # --- 3D 发射参数 ---
-    launch_lat: float = 0  # 发射纬度 (Degrees), 默认0
-    launch_lon: float = 0  # 发射经度
-    launch_azimuth: float = 90.0  # 发射方位角 (0=North, 90=East)
-
-    # --- 制导参数 ---
-    vertical_time: float = 5.0  # 垂直爬升时间
-    pitch_over_angle: float = 2.0  # 初始程序转弯角度 (deg)
-    guidance_aoa: float = 0.0  # 设定的飞行攻角 (用于产生升力, 阶段3特性)
-
-
-# ==========================================
-# 0. 预处理常量与全局数组
-# ==========================================
+# 一些常量
 R_EARTH = 6378137.0
 R_POLAR = 6356752.0
 GM = 3.986004418e14
@@ -102,26 +35,29 @@ NC_TYPE_SEARS_HAACK = 4
 NC_TYPE_V2 = 5
 NC_TYPE_UNKNOWN = -1
 
+# RKF45 系数
+RK45_C = np.array([0.0, 1 / 5, 3 / 10, 3 / 5, 1.0, 7 / 8], dtype=np.float64)
+RK45_A = np.array(
+    [
+        [0.0, 0.0, 0.0, 0.0, 0.0],
+        [1 / 5, 0.0, 0.0, 0.0, 0.0],
+        [3 / 40, 9 / 40, 0.0, 0.0, 0.0],
+        [3 / 10, -9 / 10, 6 / 5, 0.0, 0.0],
+        [-11 / 54, 5 / 2, -70 / 27, 35 / 27, 0.0],
+        [1631 / 55296, 175 / 512, 575 / 13824, 44275 / 110592, 253 / 4096],
+    ],
+    dtype=np.float64,
+)
+RK45_B = np.array(
+    [37 / 378, 0.0, 250 / 621, 125 / 594, 0.0, 512 / 1771], dtype=np.float64
+)
+RK45_B_STAR = np.array(
+    [2825 / 27648, 0.0, 18575 / 48384, 13525 / 55296, 277 / 14336, 1 / 4],
+    dtype=np.float64,
+)
 
-def get_nc_type_id(name: str) -> int:
-    name = name.lower()
-    if "conical" in name:
-        return NC_TYPE_CONICAL
-    if "ogive" in name:
-        return NC_TYPE_OGIVE
-    if "parabolic" in name:
-        return NC_TYPE_PARABOLIC
-    if "elliptical" in name:
-        return NC_TYPE_ELLIPTICAL
-    if "sears" in name:
-        return NC_TYPE_SEARS_HAACK
-    if "v2" in name:
-        return NC_TYPE_V2
-    return NC_TYPE_CONICAL
 
-
-# 大气层数据表 (转为numpy数组以提升性能)
-# Format: [Base Alt, Lapse Rate, Base Temp, Base Pressure]
+# 大气层数据表
 ATMOS_LAYERS = np.array(
     [
         [0.0, -0.0065],
@@ -136,6 +72,7 @@ ATMOS_LAYERS = np.array(
     dtype=np.float64,
 )
 
+# [Base Alt, Lapse Rate, Base Temp, Base Pressure]
 HIGH_ALT_DATA = np.array(
     [
         [86.0, 186.87, 0.3734, 3.426e-6],
@@ -163,6 +100,149 @@ HIGH_ALT_DATA = np.array(
     ],
     dtype=np.float64,
 )
+
+
+@dataclass
+class SubSatelliteConfig:
+    name_pattern: str = "Sat_{i}"  # 命名模板
+    count: int = 0  # 数量
+    mass: float = 10.0  # 单颗质量 (kg)
+    release_start_time: float = 0.0  # 相对于入轨/KickStage生成的延时 (s)
+    release_interval: float = 30.0  # 释放间隔 (s)
+    separation_velocity: float = 0.5  # 弹簧分离速度 (m/s)
+
+
+@dataclass
+class KickStageConfig:
+    enabled: bool = False
+    dry_mass: float = 100.0  # 上面级结构干重 (kg)，不含子卫星
+    fuel_mass: float = 200.0  # 总燃料质量 (kg)，包含入轨+离轨所需
+    thrust: float = 5000.0  # 发动机推力 (N)
+    isp: float = 300.0  # 比冲 (s)
+    ignition_delay: float = 0.0  # 点火延迟时间 (s)，0表示自动计算
+
+    payloads: List[SubSatelliteConfig] = field(default_factory=list)  # 子卫星载荷配置
+
+    deorbit_enabled: bool = False  # 是否启用反推
+    deorbit_fuel_mass: float = 20.0  # 预留给反推的燃料 (kg)
+    deorbit_delay: float = 60.0  # 最后一颗卫星释放后多久开始反推 (s)
+
+    @property
+    def total_payload_mass(self):
+        """计算所有子卫星的总质量"""
+        m = 0.0
+        for p in self.payloads:
+            m += p.count * p.mass
+        return m
+
+
+@dataclass
+class PayloadReleaseEvent:
+    release_time: float
+    mass: float
+    name: str
+    sep_vel: float
+    direction_type: int = 0  # 0=Prograde, 3=Random
+
+
+@dataclass
+class TrackedObject:
+    name: str
+    obj_type: int
+    state: np.ndarray  # [rx, ry, rz, vx, vy, vz, m]
+
+    # 物理属性
+    drag_area: float
+    drag_coeff_type: int  # 0=Active(Calc), 1=Fixed
+    fixed_cd: float = 0.5  # 碎片默认阻力系数
+
+    active: bool = True
+
+    # 动力学属性
+    stage_matrix: np.ndarray = field(
+        default_factory=lambda: np.zeros((0, 5))
+    )  # [thrust, dmdt, t_s, t_e]
+
+    # 制导与载荷属性
+    custom_guidance: Optional[np.ndarray] = None  # [vert, pitch, aoa, MODE]
+    release_events: List[PayloadReleaseEvent] = field(default_factory=list)
+    is_main: bool = False
+
+    # 历史记录
+    history: List[Dict] = field(default_factory=list)
+
+
+@dataclass
+class FinConfig:
+    number: int = 0
+    height: float = 0.0
+    root_chord: float = 0.0
+    tip_chord: float = 0.0
+    sweep_angle: float = 0.0
+    thickness: float = 0.0
+
+
+@dataclass
+class RocketStage:
+    fuel_mass: float  # kg
+    dry_mass: float  # kg
+    isp: float  # s
+    thrust: float  # N 推力，第一级是海平面 / 其他真空
+
+    nozzle_area: float = 0.0
+    burn_time: float = 0.0
+    dmdt: float = 0.0
+
+    def __post_init__(self):
+        if self.thrust > 0 and self.isp > 0:
+            self.dmdt = self.thrust / (self.isp * 9.80665)
+            self.burn_time = self.fuel_mass / self.dmdt
+        else:
+            self.dmdt = 0
+            self.burn_time = 0
+
+
+@dataclass
+class SimConfig:
+    stages: List[RocketStage]
+    payload_mass: float
+    rocket_diameter: float  # 直径 (m)
+    nosecone_type: str = "Conical"
+    nosecone_ld_ratio: float = 3.0
+    reentry_diameter: float = 0.0  # 再入直径 (0表示不启用)
+    fins: FinConfig = field(default_factory=FinConfig)
+    fairing_mass: float = 0.0  # 整流罩总质量 (kg)
+    fairing_sep_time: float = 0.0  # 分离时间 (绝对时间 s, 0表示不启用)
+
+    # --- 3D 发射参数 ---
+    launch_lat: float = 0  # 发射纬度 (Degrees), 默认0
+    launch_lon: float = 0  # 发射经度
+    launch_azimuth: float = 90.0  # 发射方位角 (0=North, 90=East)
+
+    # --- 制导参数 ---
+    vertical_time: float = 5.0  # 垂直爬升时间
+    pitch_over_angle: float = 2.0  # 初始程序转弯偏转角度 (deg)
+    guidance_aoa: float = 0.0  # 设定的飞行攻角 (用于产生升力)
+
+    kick_stage: KickStageConfig = field(default_factory=KickStageConfig)
+
+
+@njit(cache=True)
+def get_nc_type_id(name: str) -> int:
+    name = name.lower()
+    if "conical" in name:
+        return NC_TYPE_CONICAL
+    if "ogive" in name:
+        return NC_TYPE_OGIVE
+    if "parabolic" in name:
+        return NC_TYPE_PARABOLIC
+    if "elliptical" in name:
+        return NC_TYPE_ELLIPTICAL
+    if "sears" in name:
+        return NC_TYPE_SEARS_HAACK
+    if "v2" in name:
+        return NC_TYPE_V2
+    return NC_TYPE_CONICAL
 
 
 @njit(cache=True)
@@ -200,8 +280,12 @@ def eci_to_lla_numba(r_eci: np.ndarray, time: float) -> tuple:
 
     for _ in range(5):
         sin_lat = np.sin(lat)
+        cos_lat = np.cos(lat)
         N = a / np.sqrt(1 - e2 * sin_lat**2)
-        h = p / np.cos(lat) - N
+        if np.abs(lat) < np.radians(85.0):
+            h = p / cos_lat - N
+        else:
+            h = z / sin_lat - N * (1 - e2)
         lat = np.arctan2(z, p * (1 - e2 * N / (N + h)))
 
     return np.degrees(lat), np.degrees(lon), h
@@ -212,8 +296,8 @@ def atmosphere_numba(altitude_m: float) -> tuple:
     if altitude_m < 0:
         altitude_m = 0
 
-    # Part 1: < 86km
-    if altitude_m < 86000:
+    # Part 1: < 84.852km
+    if altitude_m < 84852.0:
         g0 = 9.80665
         R = 287.05287
         R_earth = 6356766.0
@@ -295,6 +379,163 @@ def atmosphere_numba(altitude_m: float) -> tuple:
 
 
 @njit(cache=True)
+def calculate_kepler_elements(r_vec: np.ndarray, v_vec: np.ndarray) -> np.ndarray:
+    """
+    输入: ECI 位置 (m), ECI 速度 (m/s)
+    输出: [a, e, i, raan, arg_p, true_anom, period]
+    单位: a(km), i/raan/arg_p/nu(deg), period(min)
+    """
+
+    r = np.linalg.norm(r_vec)
+    v = np.linalg.norm(v_vec)
+
+    # 0. 基础向量
+    h_vec = np.cross(r_vec, v_vec)  # 角动量向量
+    h = np.linalg.norm(h_vec)
+
+    # 节点向量 n = k x h
+    # k = [0, 0, 1]
+    n_vec = np.array([-h_vec[1], h_vec[0], 0.0])
+    n = np.linalg.norm(n_vec)
+
+    # 偏心率向量
+    # e = (1/mu) * [ (v^2 - mu/r)*r - (r.v)*v ]
+    tmp_val = v**2 - GM / r
+    e_vec = (tmp_val * r_vec - np.dot(r_vec, v_vec) * v_vec) / GM
+    e = np.linalg.norm(e_vec)
+
+    # 1. 能量与半长轴
+    # specific energy = v^2/2 - mu/r
+    energy = 0.5 * v**2 - GM / r
+
+    if abs(energy) < 1e-9:
+        a = np.inf  # 抛物线
+    else:
+        a = -GM / (2 * energy)
+
+    # 2. 倾角
+    # cos(i) = h_z / h
+    cos_i = h_vec[2] / h
+    cos_i_clipped = min(max(cos_i, -1.0), 1.0)
+    inc_rad = np.arccos(cos_i_clipped)
+
+    # 3. 升交点赤经
+    # cos(O) = n_x / n
+    if n < 1e-9:
+        raan_rad = 0.0  # 赤道轨道，未定义
+    else:
+        cos_raan = n_vec[0] / n
+        cos_raan_clipped = min(max(cos_raan, -1.0), 1.0)
+        raan_rad = np.arccos(cos_raan_clipped)
+        if n_vec[1] < 0:
+            raan_rad = 2 * np.pi - raan_rad
+
+    # 4. 近地点幅角
+    # cos(w) = n.e / (|n|*|e|)
+    if n < 1e-9 or e < 1e-9:
+        arg_p_rad = 0.0
+    else:
+        cos_w = np.dot(n_vec, e_vec) / (n * e)
+        cos_w_clipped = min(max(cos_w, -1.0), 1.0)
+        arg_p_rad = np.arccos(cos_w_clipped)
+        if e_vec[2] < 0:
+            arg_p_rad = 2 * np.pi - arg_p_rad
+
+    # 5. 真近点角
+    # cos(v) = e.r / (|e|*|r|)
+    if e < 1e-9:
+        true_anom_rad = 0.0
+    else:
+        cos_nu = np.dot(e_vec, r_vec) / (e * r)
+        cos_nu_clipped = min(max(cos_nu, -1.0), 1.0)
+        true_anom_rad = np.arccos(cos_nu_clipped)
+        if np.dot(r_vec, v_vec) < 0:
+            true_anom_rad = 2 * np.pi - true_anom_rad
+
+    # 6. 轨道周期
+    # T = 2*pi * sqrt(a^3 / mu)
+    if a > 0 and not np.isinf(a):
+        period_s = 2 * np.pi * np.sqrt(a**3 / GM)
+        period_min = period_s / 60.0
+    else:
+        period_min = 0.0  # 双曲线或抛物线
+
+    # 转换为角度和 km
+    return np.array(
+        [
+            a / 1000.0,  # a (km)
+            e,  # e
+            np.degrees(inc_rad),  # i (deg)
+            np.degrees(raan_rad),  # RAAN (deg)
+            np.degrees(arg_p_rad),  # ArgP (deg)
+            np.degrees(true_anom_rad),  # Nu (deg)
+            period_min,  # T (min)
+        ]
+    )
+
+
+@njit(cache=True)
+def estimate_time_to_apoapsis(r_vec: np.ndarray, v_vec: np.ndarray) -> float:
+    """
+    估算从当前状态滑行到远地点所需的时间（秒）
+    注意：仅适用于椭圆轨道 (0 <= e < 1)
+    """
+    r = np.linalg.norm(r_vec)
+    v = np.linalg.norm(v_vec)
+    mu = GM
+
+    # 1. 计算半长轴 a
+    spec_energy = 0.5 * v**2 - mu / r
+    if abs(spec_energy) < 1e-9:
+        return 0.0  # 抛物线
+    a = -mu / (2 * spec_energy)
+
+    if a < 0:
+        return 0.0  # 双曲线
+
+    # 2. 计算偏心率 e
+    h_vec = np.cross(r_vec, v_vec)
+    h = np.linalg.norm(h_vec)
+    tmp = v**2 - mu / r
+    e_vec = (tmp * r_vec - np.dot(r_vec, v_vec) * v_vec) / mu
+    e = np.linalg.norm(e_vec)
+
+    if e >= 1.0 or e < 1e-6:
+        return 0.0
+
+    # 3. 计算当前偏近点角
+    # cos(E) = (a - r) / (a * e)
+    cos_E = (a - r) / (a * e)
+    cos_E = min(max(cos_E, -1.0), 1.0)
+    E_rad = np.arccos(cos_E)
+
+    # 判断 E 是在 0~PI 还是 PI~2PI
+    # 如果 r.v > 0，说明正在远离近地点 (0 < E < PI)
+    # 如果 r.v < 0，说明正在接近近地点 (PI < E < 2PI)
+    if np.dot(r_vec, v_vec) < 0:
+        E_rad = 2 * np.pi - E_rad
+
+    # 4. 计算当前平均近点角
+    M_rad = E_rad - e * np.sin(E_rad)
+
+    # 5. 计算平均角速度
+    n = np.sqrt(mu / a**3)
+
+    # 6. 计算到达远地点的时间
+    # 远地点的 M = PI
+    # 如果当前 M < PI，时间 = (PI - M) / n
+    # 如果当前 M > PI，时间 = (3PI - M) / n (下一圈)
+
+    target_M = np.pi
+    if M_rad > np.pi:
+        target_M = 3 * np.pi
+
+    delta_t = (target_M - M_rad) / n
+
+    return delta_t
+
+
+@njit(cache=True)
 def get_cd_numba(
     mach: float,
     h: float,
@@ -305,6 +546,7 @@ def get_cd_numba(
     rocket_diam: float,
 ) -> float:
     """
+    HyperCFD 拟合
     fin_data format: [number, height, root_chord, tip_chord, sweep_angle, thickness]
     """
     if velocity < 0.1:
@@ -394,7 +636,7 @@ def get_cd_numba(
             b_conic = 1 / (0.054882 + 0.363845 * ld)
             cd_body = m_conic * mach + b_conic
         else:
-            cd_body = 0.075 * ld + 0.275
+            cd_body = -0.075 * ld + 0.275
 
     elif nc_type_id == NC_TYPE_OGIVE:
         if mach >= 1.2:
@@ -464,11 +706,12 @@ def calculate_gravity_numba(r_vec: np.ndarray) -> np.ndarray:
 def physics_kernel(
     t: float,
     state: np.ndarray,
-    stage_matrix: np.ndarray,  # [thrust, dmdt, t_start, t_end]
+    stage_matrix: np.ndarray,
     fin_data: np.ndarray,
-    geo_params: np.ndarray,  # [launch_az, rocket_dia, nozzle_area, reentry_dia, nc_ld]
-    guidance_params: np.ndarray,  # [vert_time, pitch_angle, aoa]
+    geo_params: np.ndarray,  # [launch_az, diam, reentry_dia, nc_ld]
+    guidance_params: np.ndarray,  # [vert_time, pitch, aoa, MODE]
     nc_type_id: int,
+    drag_props: np.ndarray,  # [drag_coeff_type, fixed_cd]
 ) -> np.ndarray:
 
     r = state[0:3]
@@ -478,9 +721,8 @@ def physics_kernel(
     # Unpack geometric params
     launch_az = geo_params[0]
     rocket_dia = geo_params[1]
-    nozzle_area = geo_params[2]
-    reentry_dia = geo_params[3]
-    nc_ld = geo_params[4]
+    reentry_dia = geo_params[2]
+    nc_ld = geo_params[3]
 
     # 1. Environment
     _, _, altitude = eci_to_lla_numba(r, t)
@@ -501,63 +743,111 @@ def physics_kernel(
 
     # stage_matrix shape: (N, 4) -> [thrust, dmdt, t_start, t_end]
     for i in range(stage_matrix.shape[0]):
+        # 增加质量检查：如果质量已经极小(燃料耗尽)，不再产生推力
         if stage_matrix[i, 2] <= t < stage_matrix[i, 3]:
-            thrust_nominal = stage_matrix[i, 0]
-            dmdt_val = stage_matrix[i, 1]
-            # Pressure correction for first stage (index 0 check via time usually)
-            if i == 0:
-                thrust_val = thrust_nominal + nozzle_area * (101325.0 - pressure)
-            else:
-                thrust_val = thrust_nominal
-            is_burning = True
+            # 只有当仍有足够质量时才产生推力（假设空重至少 > 1kg）
+            if m > 1.0:
+                thrust_raw = stage_matrix[i, 0]
+                dmdt_val = stage_matrix[i, 1]
+                stage_area = stage_matrix[i, 4]  # 从矩阵读取当前级的面积
+                # 大气内压力修正
+                # 如果是主火箭第一级，nozzle_area 会很大，产生显著修正
+                # 如果是上面级或卫星，nozzle_area 应为 0 (在构造时处理)
+                thrust_val = thrust_raw + stage_area * (101325.0 - pressure)
+                is_burning = True
             break
 
     # 4. Orientation & Guidance
+    guidance_mode = guidance_params[3]
+
+    # 基础方向向量
     r_mag = np.linalg.norm(r)
-    up = r / r_mag
-    ez = np.array([0.0, 0.0, 1.0])
-    east = np.cross(ez, up)
-    norm_east = np.linalg.norm(east)
-    if norm_east > 1e-9:
-        east = east / norm_east
+    if r_mag > 1e-3:
+        up = r / r_mag
     else:
-        east = np.array([1.0, 0.0, 0.0])  # Pole singularity handling
-
-    north = np.cross(up, east)
-
-    az_rad = np.radians(launch_az)
-    launch_dir_h = np.sin(az_rad) * east + np.cos(az_rad) * north
-
-    vert_time = guidance_params[0]
-    pitch_angle = guidance_params[1]
-    guidance_aoa = guidance_params[2]
+        up = np.array([0.0, 0.0, 1.0])
 
     orientation = np.zeros(3)
 
-    if t < vert_time:
-        orientation = up
-    elif t < vert_time + 10.0:
-        ratio = (t - vert_time) / 10.0
-        tilt_angle = np.radians(pitch_angle) * ratio
-        orientation = np.cos(tilt_angle) * up + np.sin(tilt_angle) * launch_dir_h
-        orientation = orientation / np.linalg.norm(orientation)
-    else:
-        # Gravity Turn / AoA phase
-        if v_rel_mag > 1.0:
-            vel_dir = v_rel / v_rel_mag
-            if guidance_aoa != 0:
-                traj_normal = np.cross(v_rel, -up)
-                tn_norm = np.linalg.norm(traj_normal)
-                if tn_norm > 1e-9:
-                    traj_normal /= tn_norm
-                    aoa_rad = np.radians(guidance_aoa)
-                    orientation = vel_dir * np.cos(aoa_rad) + np.cross(
-                        traj_normal, vel_dir
-                    ) * np.sin(aoa_rad)
+    # === MODE 0: LAUNCH (发射程序) ===
+    if guidance_mode == GUIDANCE_MODE_LAUNCH:
+        ez = np.array([0.0, 0.0, 1.0])
+        east = np.cross(ez, up)
+        norm_east = np.linalg.norm(east)
+        if norm_east > 1e-9:
+            east = east / norm_east
+        else:
+            east = np.array([1.0, 0.0, 0.0])
+
+        north = np.cross(up, east)
+
+        az_rad = np.radians(launch_az)
+        launch_dir_h = np.sin(az_rad) * east + np.cos(az_rad) * north
+
+        vert_time = guidance_params[0]
+        pitch_angle = guidance_params[1]
+        guidance_aoa = guidance_params[2]
+
+        if t < vert_time:
+            orientation = up
+        elif t < vert_time + 10.0:
+            ratio = (t - vert_time) / 10.0
+            tilt_angle = np.radians(pitch_angle) * ratio
+            orientation = np.cos(tilt_angle) * up + np.sin(tilt_angle) * launch_dir_h
+            # Normalize to be safe
+            norm_o = np.linalg.norm(orientation)
+            if norm_o > 0:
+                orientation = orientation / norm_o
+            else:
+                orientation = up
+        else:
+            # Gravity Turn / AoA phase
+            if v_rel_mag > 1.0:
+                vel_dir = v_rel / v_rel_mag
+                # 如果设定了 AoA 且不为 0
+                if abs(guidance_aoa) > 0.001:
+                    # 计算轨迹法向量 (Trajectory Normal) 用于施加 AoA
+                    # 这里简化为在垂直平面内施加
+                    traj_normal = np.cross(v_rel, -up)
+                    tn_norm = np.linalg.norm(traj_normal)
+
+                    if tn_norm > 1e-9:
+                        traj_normal /= tn_norm
+                        aoa_rad = np.radians(guidance_aoa)
+                        # 在速度方向的基础上，向法向偏转 AoA 角度
+                        # Cross(Normal, Vel) gives the 'Lift' direction usually
+                        lift_plane_vec = np.cross(traj_normal, vel_dir)
+                        orientation = vel_dir * np.cos(
+                            aoa_rad
+                        ) + lift_plane_vec * np.sin(aoa_rad)
+                    else:
+                        orientation = vel_dir
                 else:
                     orientation = vel_dir
             else:
-                orientation = vel_dir
+                orientation = up
+
+    # === MODE 1: PROGRADE (顺向模式) ===
+    elif guidance_mode == GUIDANCE_MODE_PROGRADE:
+        v_mag = np.linalg.norm(v)
+        if v_mag > 0.1:
+            orientation = v / v_mag
+        else:
+            orientation = up
+
+    # === MODE -1: PASSIVE (纯被动/随动模式) ===
+    elif guidance_mode == -1.0:
+        # 模拟气动稳定（顺风）
+        # 假设物体重心设计合理，会自动对准相对风向
+        if v_rel_mag > 0.1:
+            orientation = v_rel / v_rel_mag
+        else:
+            orientation = up
+
+    # === FALLBACK ===
+    else:
+        if v_rel_mag > 0.1:
+            orientation = v_rel / v_rel_mag
         else:
             orientation = up
 
@@ -570,9 +860,23 @@ def physics_kernel(
     curr_diam = (
         rocket_dia if is_burning else (reentry_dia if reentry_dia > 0 else rocket_dia)
     )
-    cd = get_cd_numba(
-        mach.item(), altitude, v_rel_mag.item(), nc_type_id, nc_ld, fin_data, curr_diam
-    )
+
+    # 获取 Cd
+    use_fixed_cd = drag_props[0] == 1.0
+    fixed_cd_val = drag_props[1]
+
+    if use_fixed_cd:
+        cd = fixed_cd_val
+    else:
+        cd = get_cd_numba(
+            mach.item(),
+            altitude,
+            v_rel_mag.item(),
+            nc_type_id,
+            nc_ld,
+            fin_data,
+            curr_diam,
+        )
 
     area = np.pi * (curr_diam / 2.0) ** 2
     q = 0.5 * rho * v_rel_mag**2
@@ -581,14 +885,23 @@ def physics_kernel(
     if v_rel_mag > 0:
         f_drag = -q * cd * area * (v_rel / v_rel_mag)
 
-    # Lift (Simplified)
+    # Lift (Simplified) - 仅在 Launch Mode 且有 AoA 时启用
     f_lift = np.zeros(3)
-    if guidance_aoa != 0 and v_rel_mag > 10.0:
+    guidance_aoa = guidance_params[2]
+
+    if (
+        guidance_mode == GUIDANCE_MODE_LAUNCH
+        and abs(guidance_aoa) > 0.001
+        and v_rel_mag > 10.0
+        and rho > 1e-9
+    ):
         cl = 2.0 * np.radians(guidance_aoa)  # Linear approx
         f_lift_mag = q * cl * area
+
         cross_vec = np.cross(v_rel, orientation)
         lift_dir = np.cross(cross_vec, v_rel)
         ld_norm = np.linalg.norm(lift_dir)
+
         if ld_norm > 1e-9:
             lift_dir /= ld_norm
             f_lift = f_lift_mag * lift_dir
@@ -596,7 +909,12 @@ def physics_kernel(
     f_gravity = calculate_gravity_numba(r) * m
 
     f_total = f_thrust + f_drag + f_lift + f_gravity
-    acc = f_total / m
+
+    # 防止质量为0除零错误
+    if m > 1e-6:
+        acc = f_total / m
+    else:
+        acc = np.zeros(3)
 
     # Return [vx, vy, vz, ax, ay, az, mdot]
     res = np.empty(7, dtype=np.float64)
@@ -621,8 +939,13 @@ class RocketSimulator3D:
         for i, s in enumerate(self.cfg.stages):
             t_start = acc_t
             t_end = acc_t + s.burn_time
-            stages_list.append([s.thrust, s.dmdt, t_start, t_end])
-
+            # 只有第一级才设置喷管面积（用于背压修正）
+            if i == 0:
+                nozzle_area = s.nozzle_area
+            else:
+                nozzle_area = 0.0  # 其他级使用真空推力，无需背压修正
+            stages_list.append([s.thrust, s.dmdt, t_start, t_end, nozzle_area])
+            # 仅当不是最后一级时，才添加“级间分离”事件
             # 最后一级应在“载荷分离”事件中处理
             if i < num_stages - 1:
                 self.stage_timings.append((t_end, s.dry_mass, i))
@@ -633,6 +956,11 @@ class RocketSimulator3D:
         # 卫星分离时间 (默认为末级关机后 2秒)
         self.payload_sep_time = acc_t + 2.0
         self.payload_separated = False
+        # === 整流罩状态标记 ===
+        self.fairing_separated = False
+        # 如果配置为0，视为不需要分离
+        if self.cfg.fairing_mass <= 0 or self.cfg.fairing_sep_time <= 0:
+            self.fairing_separated = True
 
         # --- 2. 预计算气动数据 ---
         f = self.cfg.fins
@@ -652,7 +980,6 @@ class RocketSimulator3D:
             [
                 self.cfg.launch_azimuth,
                 self.cfg.rocket_diameter,
-                self.cfg.nozzle_area,
                 self.cfg.reentry_diameter,
                 self.cfg.nosecone_ld_ratio,
             ],
@@ -660,7 +987,12 @@ class RocketSimulator3D:
         )
 
         self.guidance_params = np.array(
-            [self.cfg.vertical_time, self.cfg.pitch_over_angle, self.cfg.guidance_aoa],
+            [
+                self.cfg.vertical_time,
+                self.cfg.pitch_over_angle,
+                self.cfg.guidance_aoa,
+                GUIDANCE_MODE_LAUNCH,
+            ],
             dtype=np.float64,
         )
 
@@ -673,6 +1005,25 @@ class RocketSimulator3D:
             + self.cfg.payload_mass
         )
 
+        if len(self.cfg.stages) > 0:
+            stage1 = self.cfg.stages[0]
+
+            thrust_sl = stage1.thrust
+            weight_force = m0 * G0  # G0 = 9.80665
+
+            twr = thrust_sl / weight_force
+
+            if twr <= 1.0:
+                # 无法起飞，抛出异常终止仿真
+                raise ValueError(
+                    f"\n[ERROR] Insufficient Thrust-to-Weight Ratio ({twr:.3f} <= 1.0)!\n"
+                    f"The rocket is too heavy to lift off. \n"
+                    f"Action: Increase Stage 1 thrust or reduce payload/fuel mass."
+                )
+            elif twr < 1.2:
+                # 推重比过低，重力损失会很大
+                print("WARNING: Low TWR (< 1.2). Gravity losses will be high.")
+
         main_rocket = TrackedObject(
             name="Main Rocket",
             obj_type=OBJ_TYPE_ROCKET,
@@ -680,6 +1031,7 @@ class RocketSimulator3D:
             drag_area=np.pi * (self.cfg.rocket_diameter / 2) ** 2,
             drag_coeff_type=0,  # 动态计算 Cd
             stage_matrix=self.main_stage_matrix,
+            is_main=True,
         )
         self.objects.append(main_rocket)
 
@@ -689,167 +1041,584 @@ class RocketSimulator3D:
         v_rot = np.cross(omega_vec, r_ecef)
         return r_ecef, v_rot
 
+    def _resolve_object_params(self, obj: TrackedObject):
+        """
+        辅助方法：根据物体类型解析物理参数，解决参数继承和错配问题。
+        返回: (geo_params, fin_data, guidance_params, drag_props, nc_type_id)
+        """
+
+        # 1. 阻力属性 (Drag Props)
+        # [UseFixedCD(0/1), FixedCDValue]
+        drag_props = np.array(
+            [float(obj.drag_coeff_type), obj.fixed_cd], dtype=np.float64
+        )
+
+        # 2. 几何与尾翼参数 (Geometry & Fins)
+        if obj.is_main:
+            # 只有主火箭才使用 Config 中的完整几何参数
+            geo_params = self.geo_params
+            fin_data = self.fin_data
+            nc_type = self.nc_type_id
+        else:
+            # Kick Stage, Satellites, Debris
+            # 根据 drag_area 反推等效直径
+            eff_diam = 2.0 * np.sqrt(obj.drag_area / np.pi)
+
+            # [LaunchAz(Ignored), Diam, ReentryDiam, NcLD]
+            geo_params = np.array([0.0, eff_diam, eff_diam, 1.0], dtype=np.float64)
+
+            # 无尾翼
+            fin_data = np.zeros(6, dtype=np.float64)
+            nc_type = NC_TYPE_UNKNOWN
+
+        # 3. 制导参数 (Guidance)
+        # 目标格式: [VertTime, Pitch, AoA, MODE]
+
+        if obj.custom_guidance is not None:
+            # 优先使用物体自带的制导设定
+            # 确保长度为 4
+            g_params = obj.custom_guidance
+
+        elif obj.is_main:
+            # 主火箭继承 Config 的发射参数，并设为 MODE_LAUNCH (0)
+            base = self.guidance_params
+            g_params = np.array(
+                [base[0], base[1], base[2], GUIDANCE_MODE_LAUNCH], dtype=np.float64
+            )
+
+        else:
+            # 其他所有物体（卫星、残骸），如果没有自定义制导
+            # 默认为 PASSIVE 模式，无升力
+            g_params = np.array(
+                [0.0, 0.0, 0.0, GUIDANCE_MODE_PASSIVE], dtype=np.float64
+            )
+
+        return geo_params, fin_data, g_params, drag_props, nc_type
+
     def _calculate_derivatives(
         self, t: float, current_state: np.ndarray, obj: TrackedObject
     ) -> np.ndarray:
-        # 如果是主火箭，使用全功能物理核心
-        if obj.obj_type == OBJ_TYPE_ROCKET:
-            return physics_kernel(
-                t,
-                current_state,
-                obj.stage_matrix,
-                self.fin_data,
-                self.geo_params,
-                self.guidance_params,
-                self.nc_type_id,
-            )
+        """
+        计算状态导数 (Physics Wrapper)。
+        已优化：稳健的参数构造，消除隐式继承 Bug。
+        """
 
-        # --- 碎片/卫星 物理核心 ---
-        # 构造空推力矩阵
-        empty_thrust = np.zeros((0, 4), dtype=np.float64)
-        # 估算等效直径
-        eff_diam = 2 * np.sqrt(obj.drag_area / np.pi)
-        # 被动制导参数 [vert_time, pitch, aoa] -> 全部无效化，进入无控弹道
-        passive_guidance = np.array([-1.0, 0.0, 0.0], dtype=np.float64)
-        # 几何参数：仅直径生效
-        passive_geo = np.array([0.0, eff_diam, 0.0, eff_diam, 1.0], dtype=np.float64)
-        # 无尾翼
-        no_fins = np.zeros(6, dtype=np.float64)
+        # 1. 使用辅助函数解析所有物理参数
+        geo_params, fin_data, g_params, drag_props, nc_type = (
+            self._resolve_object_params(obj)
+        )
 
+        # 2. 调用更新后的物理内核
         return physics_kernel(
             t,
             current_state,
-            empty_thrust,
-            no_fins,
-            passive_geo,
-            passive_guidance,
-            NC_TYPE_UNKNOWN,
+            obj.stage_matrix,  # 动力矩阵
+            fin_data,  # 尾翼数据
+            geo_params,  # 几何数据
+            g_params,  # 制导数据 (含 Mode)
+            nc_type,  # 鼻锥类型
+            drag_props,  # 阻力属性 (含开关)
         )
 
-    def run(self, dt: float = 0.05):
-        print(f"Starting Multi-Body Simulation with dt={dt}s...")
+    def _rk45_step_single(self, t: float, dt: float, obj: TrackedObject):
+        """
+        对单个物体执行一步 RK45，返回 (新状态, 误差向量)
+        """
+        y0 = obj.state
 
-        # 初始记录
+        # k1
+        k1 = self._calculate_derivatives(t, y0, obj)
+
+        # k2
+        y_temp = y0 + dt * (RK45_A[1, 0] * k1)
+        k2 = self._calculate_derivatives(t + RK45_C[1] * dt, y_temp, obj)
+
+        # k3
+        y_temp = y0 + dt * (RK45_A[2, 0] * k1 + RK45_A[2, 1] * k2)
+        k3 = self._calculate_derivatives(t + RK45_C[2] * dt, y_temp, obj)
+
+        # k4
+        y_temp = y0 + dt * (RK45_A[3, 0] * k1 + RK45_A[3, 1] * k2 + RK45_A[3, 2] * k3)
+        k4 = self._calculate_derivatives(t + RK45_C[3] * dt, y_temp, obj)
+
+        # k5
+        y_temp = y0 + dt * (
+            RK45_A[4, 0] * k1
+            + RK45_A[4, 1] * k2
+            + RK45_A[4, 2] * k3
+            + RK45_A[4, 3] * k4
+        )
+        k5 = self._calculate_derivatives(t + RK45_C[4] * dt, y_temp, obj)
+
+        # k6
+        y_temp = y0 + dt * (
+            RK45_A[5, 0] * k1
+            + RK45_A[5, 1] * k2
+            + RK45_A[5, 2] * k3
+            + RK45_A[5, 3] * k4
+            + RK45_A[5, 4] * k5
+        )
+        k6 = self._calculate_derivatives(t + RK45_C[5] * dt, y_temp, obj)
+
+        # 计算 5阶解 (用于更新状态)
+        y_new = y0 + dt * (
+            RK45_B[0] * k1 + RK45_B[2] * k3 + RK45_B[3] * k4 + RK45_B[5] * k6
+        )
+
+        # 计算 4阶解 (仅用于估算误差)
+        y_star = y0 + dt * (
+            RK45_B_STAR[0] * k1
+            + RK45_B_STAR[2] * k3
+            + RK45_B_STAR[3] * k4
+            + RK45_B_STAR[4] * k5
+            + RK45_B_STAR[5] * k6
+        )
+
+        # 误差向量
+        error_vec = np.abs(y_new - y_star)
+
+        return y_new, error_vec
+
+    def run_adaptive(
+        self,
+        initial_dt: float = 0.1,
+        min_dt: float = 1e-4,
+        max_dt: float = 10.0,  # 允许在大气外大步长滑行
+        rtol: float = 1e-5,
+        atol: float = 1e-5,
+    ):
+
+        print(f"Starting Adaptive Simulation (RK45)...")
         self._record_all_states()
 
+        dt = initial_dt
+
         running = True
+
+        last_record_time = self.time
         while running:
             t = self.time
 
-            # 检查是否有物体还在飞行
-            active_count = sum(1 for o in self.objects if o.active)
-            if active_count == 0 or t > 20000:  # 超时保护
+            # 0. 仿真结束检查
+            active_objs = [o for o in self.objects if o.active]
+            if not active_objs or t > 50000:  # 稍微放宽时间限制
                 print("Simulation finished.")
                 break
 
-            # --- 1. 遍历所有物体进行积分 ---
-            for obj in self.objects:
-                if not obj.active:
-                    continue
+            # 1. 获取下一个关键事件时间点
+            next_event_t = self._get_next_event_time(t)
 
-                state_vec = obj.state
+            # 2. 步长调整逻辑 (Event Crossing Check)
+            hit_event = False
+            # 如果当前步长会跨越事件，强制缩短步长，使其刚好落在事件上
+            if next_event_t != float("inf") and (t + dt) > next_event_t + 1e-7:
+                dt = next_event_t - t
+                hit_event = True
+                if dt < min_dt:
+                    dt = min_dt  # 保护
 
-                # 撞地检测
-                rx, ry, rz = state_vec[0:3]
-                if t > 5.0:  # 发射后几秒再检测
-                    dist_sq = (rx**2 + ry**2) / R_EARTH**2 + (rz**2) / R_POLAR**2
-                    if dist_sq < 0.999995:  # 稍微小于1以容忍误差
-                        print(f"[{obj.name}] Impacted Earth at t={t:.2f}s")
+            # 3. 尝试步进 (Trial Step)
+            step_accepted = False
+
+            while not step_accepted:
+                proposed_states = []
+                max_error_ratio = 0.0
+
+                # 对所有活跃物体计算 RK45
+                for obj in active_objs:
+                    # 使用精确的海拔计算
+                    lat, lon, altitude = eci_to_lla_numba(obj.state[0:3], t)
+
+                    # 计算径向速度，用于判断是否在下降
+                    v_rad = 0.0
+                    if np.linalg.norm(obj.state[0:3]) > 0:
+                        v_rad = np.dot(obj.state[3:6], obj.state[0:3]) / np.linalg.norm(
+                            obj.state[0:3]
+                        )
+
+                    # 判定条件：
+                    # 1. 高度低于地面 (允许 50m 的缓冲，防止数值抖动)
+                    # 2. 并不是刚发射 (t > 1.0) 或者 正在向下掉 (v_rad < 0)
+                    # 3. 必须处于 active 状态
+                    if obj.active and altitude < -50.0 and t > 1.0 and v_rad < 0:
                         obj.active = False
+                        print(f"IMPACT: {obj.name} impacted ground at t={t:.2f}s")
+                        proposed_states.append((obj, obj.state))
                         continue
 
-                # RK4 积分
-                try:
-                    # 获取当前状态的副本作为起点
-                    y_curr = state_vec
-                    k1 = self._calculate_derivatives(t, y_curr, obj)
-                    k2 = self._calculate_derivatives(
-                        t + dt / 2, y_curr + (dt / 2) * k1, obj
-                    )
-                    k3 = self._calculate_derivatives(
-                        t + dt / 2, y_curr + (dt / 2) * k2, obj
-                    )
-                    k4 = self._calculate_derivatives(t + dt, y_curr + dt * k3, obj)
-                    obj.state = y_curr + (dt / 6) * (k1 + 2 * k2 + 2 * k3 + k4)
+                    y_new, err_vec = self._rk45_step_single(t, dt, obj)
 
-                except Exception as e:
-                    print(f"Error integrating {obj.name}: {e}")
+                    # 误差计算
+                    scale = atol + np.abs(obj.state) * rtol
+                    ratio_vec = err_vec / (scale + 1e-30)
+                    curr_max_ratio = np.max(ratio_vec)
 
-            # --- 2. 事件检测 (仅针对主火箭) ---
-            main_rocket = next(
-                (o for o in self.objects if o.obj_type == OBJ_TYPE_ROCKET and o.active),
-                None,
-            )
+                    if curr_max_ratio > max_error_ratio:
+                        max_error_ratio = curr_max_ratio
 
-            if main_rocket:
-                # A. 级间分离逻辑
-                # 使用一个新的列表来存储“尚未发生”的事件
-                remaining_timings = []
+                    proposed_states.append((obj, y_new))
 
-                for sep_event in self.stage_timings:
-                    sep_time, dry_mass, idx = sep_event
-                    if t >= sep_time:
-                        print(
-                            f"Event: Stage {idx+1} Separation at t={t:.2f}s. Dropping mass: {dry_mass}kg"
-                        )
+                # 判定
+                if max_error_ratio <= 1.0 or dt <= min_dt:
+                    # === ACCEPT ===
+                    step_accepted = True
+                    self.time += dt
 
-                        # 1. 主火箭减重
-                        main_rocket.state[6] -= dry_mass
-                        # 2. 生成废弃级对象
-                        stage_name = f"Stage {idx+1} Body"
-                        self._spawn_debris(
-                            main_rocket, dry_mass, stage_name, OBJ_TYPE_STAGE
-                        )
+                    # 更新状态
+                    for obj, y_new in proposed_states:
+                        obj.state = y_new
+
+                    # 记录
+                    if hit_event or (self.time - last_record_time > 1.0):
+                        self._record_all_states()
+
+                    # 计算下一步推荐步长
+                    if max_error_ratio < 1e-10:
+                        max_error_ratio = 1e-10
+
+                    if not hit_event:
+                        dt_next = dt * 0.9 * (max_error_ratio**-0.2)
+                        dt_next = min(dt_next, dt * 5.0, max_dt)
+                        dt = dt_next
                     else:
-                        # 时间未到，保留该事件
-                        remaining_timings.append(sep_event)
+                        # 刚处理完事件，重置步长以保证物理计算稳定
+                        dt = initial_dt
 
-                # 更新列表，去掉已触发的事件
-                self.stage_timings = remaining_timings
-                # B. 卫星/载荷分离逻辑
-                if not self.payload_separated and t >= self.payload_sep_time:
-                    print(f"Event: Payload Separation at t={t:.2f}s")
-                    self.payload_separated = True
-                    # 此时主火箭包含: 末级干重 + 载荷
-                    total_m = main_rocket.state[6]
-                    payload_m = self.cfg.payload_mass
-                    # 剩下的就是末级干重
-                    upper_stage_m = total_m - payload_m
+                else:
+                    # === REJECT ===
+                    dt_next = dt * 0.9 * (max_error_ratio**-0.2)
+                    dt_next = max(dt_next, dt * 0.1)  # 别缩太快
+                    dt = dt_next
+                    if dt < min_dt:
+                        dt = min_dt  # 强行推进
 
-                    # 1. 生成卫星对象 (先生成卫星，带走 payload_m)
-                    self._spawn_debris(
-                        main_rocket, payload_m, "Satellite", OBJ_TYPE_SAT
-                    )
+            # 4. 执行事件检查
+            # 只有当 step_accepted 为 True，且时间推进后，才检查
+            self._check_events()
 
-                    main_rocket.name = "Upper Stage Body"
-                    main_rocket.obj_type = OBJ_TYPE_STAGE
-                    main_rocket.state[6] = upper_stage_m
+    def _get_next_event_time(self, current_t: float) -> float:
+        future_times = []
 
-                    # 增加阻力面积以模拟翻滚
-                    main_rocket.drag_area = main_rocket.drag_area * 4.0
+        # 1. 主火箭级间分离时间
+        for stage_evt in self.stage_timings:
+            t_sep = stage_evt[0]
+            if t_sep > current_t:
+                future_times.append(t_sep)
 
-            self.time += dt
-            self._record_all_states()
+        # 2. 载荷/上面级分离时间
+        if not self.payload_separated and self.payload_sep_time > current_t:
+            future_times.append(self.payload_sep_time)
 
-    def _spawn_debris(
-        self, parent_obj: TrackedObject, mass: float, name: str, o_type: int
+        # 3. 垂直爬升结束时间 (影响制导)
+        if self.cfg.vertical_time > current_t:
+            future_times.append(self.cfg.vertical_time)
+        # 整流罩
+        if not self.fairing_separated and self.cfg.fairing_sep_time > current_t:
+            future_times.append(self.cfg.fairing_sep_time)
+
+        # 4. [新增] 扫描所有物体的子卫星释放计划
+        for obj in self.objects:
+            if obj.active and obj.release_events:
+                # 因为 release_events 是按时间排序的，只看第一个即可
+                next_release = obj.release_events[0].release_time
+                if next_release > current_t:
+                    future_times.append(next_release)
+
+        # 5. 扫描所有物体的推力开关机时间 (确保积分精确落在关机点)
+        for obj in self.objects:
+            if obj.active:
+                for row in obj.stage_matrix:
+                    t_start, t_end = row[2], row[3]
+                    if t_start > current_t:
+                        future_times.append(t_start)
+                    if t_end > current_t:
+                        future_times.append(t_end)
+
+        if not future_times:
+            return float("inf")  # 没有未来事件了
+
+        return min(future_times)
+
+    def _spawn_object(
+        self,
+        parent: TrackedObject,
+        mass: float,
+        name: str,
+        obj_type: int,
+        drag_area: Optional[float] = None,
+        stage_matrix=None,
+        guidance=None,
+        velocity_offset=None,
     ):
-        new_state = parent_obj.state.copy()
-        new_state[6] = mass
+        # 1. 继承状态
+        new_state = parent.state.copy()
+        new_state[6] = mass  # 重置质量
 
-        if o_type == OBJ_TYPE_SAT:
-            area = 1.5
-        else:
-            area = parent_obj.drag_area * 4.0
+        # 2. 应用速度增量和位置防重叠
+        if velocity_offset is not None:
+            # 速度直接叠加
+            new_state[3:6] += velocity_offset
 
+            # 位置偏移：沿 dV 方向移动 5米，防止物理重叠
+            v_norm = np.linalg.norm(velocity_offset)
+            if v_norm > 1e-6:
+                pos_offset = (velocity_offset / v_norm) * 5.0
+                new_state[0:3] += pos_offset
+            else:
+                # 如果 dV 为 0 (例如单纯释放)，沿速度方向或随机方向偏移
+                v_parent = np.linalg.norm(parent.state[3:6])
+                if v_parent > 0.1:
+                    dir_vec = parent.state[3:6] / v_parent
+                    new_state[0:3] += dir_vec * 5.0
+                else:
+                    new_state[0] += 5.0  # 随便移一下
+
+        # 3. 默认参数处理
+        if drag_area is None:
+            drag_area = parent.drag_area  # 默认继承
+        if stage_matrix is None:
+            stage_matrix = np.zeros((0, 5))  # 默认无动力
+
+        # 4. 创建对象
         new_obj = TrackedObject(
             name=name,
-            obj_type=o_type,
+            obj_type=obj_type,
             state=new_state,
-            drag_area=area,
-            drag_coeff_type=1,  # 固定 Cd
+            drag_area=drag_area,
+            drag_coeff_type=1,  # 分离物体通常使用固定Cd
+            stage_matrix=stage_matrix,
+            custom_guidance=guidance,
         )
+
         self.objects.append(new_obj)
+        return new_obj
+
+    def _check_events(self):
+        t = self.time
+
+        # 1. 查找主火箭 (用于级间分离)
+        main_rocket = next(
+            (o for o in self.objects if o.is_main and o.active),
+            None,
+        )
+
+        # 2. 处理主火箭级间分离
+        if main_rocket:
+            self._handle_main_rocket_staging(main_rocket, t)
+            self._handle_fairing_separation(main_rocket, t)
+            self._handle_main_payload_separation(main_rocket, t)
+
+        # 3. 处理通用释放事件 (KickStage 释放子卫星)
+        # 遍历所有拥有 release_events 的物体
+        for obj in self.objects:
+            if not obj.active or not obj.release_events:
+                continue
+
+            # 处理到期的事件
+            while obj.release_events and t >= obj.release_events[0].release_time:
+                evt = obj.release_events.pop(0)
+                self._execute_release_event(obj, evt)
+
+    def _handle_main_rocket_staging(self, rocket: TrackedObject, t: float):
+        # 筛选出当前时间点需要发生的事件
+        remaining = []
+        for sep in self.stage_timings:
+            sep_time, dry_mass, idx = sep
+            if t >= sep_time:
+                print(f"Event: Stage {idx+1} Separation at t={t:.2f}s")
+                # 减重
+                rocket.state[6] -= dry_mass
+                # 生成废弃级 (调用统一工厂)
+                self._spawn_object(
+                    parent=rocket,
+                    mass=dry_mass,
+                    name=f"Stage {idx+1} Body",
+                    obj_type=OBJ_TYPE_STAGE,
+                    drag_area=rocket.drag_area * 4.0,  # 翻滚模拟
+                    stage_matrix=np.zeros((0, 5)),
+                )
+            else:
+                remaining.append(sep)
+        self.stage_timings = remaining
+
+    def _handle_main_payload_separation(self, rocket: TrackedObject, t: float):
+        if not self.payload_separated and t >= self.payload_sep_time:
+            self.payload_separated = True
+            print(f"Event: Payload Separation at t={t:.2f}s")
+
+            # 载荷总质量 (包含 KickStage 干重+燃料+子卫星)
+            payload_total_mass = self.cfg.payload_mass
+
+            # 主火箭扣除载荷
+            rocket.state[6] -= payload_total_mass
+
+            # 决定生成什么：Kick Stage (分配器) 还是 被动卫星
+            if self.cfg.kick_stage.enabled:
+                self._setup_and_spawn_kick_stage(rocket, payload_total_mass, t)
+            else:
+                self._spawn_object(
+                    rocket, payload_total_mass, "Satellite", OBJ_TYPE_SAT, drag_area=1.5
+                )
+
+            # 主火箭变为末级残骸
+            rocket.name = "Upper Stage Body"
+            rocket.obj_type = OBJ_TYPE_STAGE
+            rocket.drag_area *= 4.0
+            rocket.stage_matrix = np.zeros((0, 5))
+
+    # ==========================================
+    # 业务逻辑 B: 上面级/分配器逻辑
+    # ==========================================
+    def _setup_and_spawn_kick_stage(self, parent: TrackedObject, mass: float, t: float):
+        """配置并生成 Kick Stage，包含入轨点火、子卫星计划以及反推离轨"""
+        ks_cfg = self.cfg.kick_stage
+
+        # --- 1. 计算入轨点火 (Insertion Burn) ---
+        # 扣除预留给反推的燃料，剩下的用于入轨
+        insertion_fuel = ks_cfg.fuel_mass
+        if ks_cfg.deorbit_enabled:
+            insertion_fuel -= ks_cfg.deorbit_fuel_mass
+            if insertion_fuel < 0:
+                insertion_fuel = 0
+
+        dmdt = ks_cfg.thrust / (ks_cfg.isp * 9.80665)
+        burn_time_insertion = insertion_fuel / dmdt
+
+        # 滑行逻辑
+        r, v = parent.state[0:3], parent.state[3:6]
+        time_to_apo = estimate_time_to_apoapsis(r, v)
+
+        if time_to_apo > burn_time_insertion and np.linalg.norm(r) > (R_EARTH + 100000):
+            delay = time_to_apo - burn_time_insertion / 2.0
+            print(f"  -> Coasting to Apoapsis ({delay:.1f}s delay)")
+        else:
+            delay = ks_cfg.ignition_delay
+
+        t_start_1 = t + delay
+        t_end_1 = t_start_1 + burn_time_insertion
+
+        # 这里的 nozzle_area 设为 0，真空推力，不受大气压影响
+        # 矩阵格式: [thrust, dmdt, t_start, t_end, area]
+        matrix_list = [[ks_cfg.thrust, dmdt, t_start_1, t_end_1, 0.0]]
+
+        # --- 2. 规划子卫星释放时间 ---
+        # 记录最后一个事件的时间，用于安排反推
+        last_event_time = t_end_1 + 10.0
+
+        # 临时存储事件，稍后赋值给对象
+        payload_events = []
+
+        current_release_base = t_end_1 + 10.0  # 入轨后 10s 开始释放
+
+        for p_cfg in ks_cfg.payloads:
+            curr_t = current_release_base + p_cfg.release_start_time
+            for i in range(p_cfg.count):
+                evt = PayloadReleaseEvent(
+                    release_time=curr_t,
+                    mass=p_cfg.mass,
+                    name=p_cfg.name_pattern.format(i=i + 1),
+                    sep_vel=p_cfg.separation_velocity,
+                    direction_type=3,  # Random
+                )
+                payload_events.append(evt)
+
+                # 更新最后时间
+                if curr_t > last_event_time:
+                    last_event_time = curr_t
+
+                curr_t += p_cfg.release_interval
+
+        # 排序事件
+        payload_events.sort(key=lambda x: x.release_time)
+
+        # --- 3. 计算反推离轨点火 (Deorbit Burn) ---
+        if ks_cfg.deorbit_enabled and ks_cfg.deorbit_fuel_mass > 0:
+            burn_time_deorbit = ks_cfg.deorbit_fuel_mass / dmdt
+
+            t_start_2 = last_event_time + ks_cfg.deorbit_delay
+            t_end_2 = t_start_2 + burn_time_deorbit
+
+            print(
+                f"  -> Scheduled Deorbit Burn at t={t_start_2:.1f}s (Duration: {burn_time_deorbit:.1f}s)"
+            )
+
+            # 推力设为负值 (-ks_cfg.thrust)
+            matrix_list.append([-ks_cfg.thrust, dmdt, t_start_2, t_end_2, 0.0])
+
+        # --- 4. 生成对象 ---
+        ks_obj = self._spawn_object(
+            parent=parent,
+            mass=mass,
+            name="Dispenser_Stage",
+            obj_type=OBJ_TYPE_ROCKET,
+            drag_area=2.0,
+            stage_matrix=np.array(matrix_list, dtype=np.float64),
+            guidance=np.array([0.0, 0.0, 0.0, 1.0]),  # 1.0 = Prograde Mode
+        )
+
+        ks_obj.release_events = payload_events
+
+    def _execute_release_event(self, parent: TrackedObject, evt: PayloadReleaseEvent):
+        # 1. 计算分离 Delta V (子卫星相对于惯性系的速度增量贡献)
+
+        v_rel_vec = self._calculate_separation_velocity(
+            parent, evt.sep_vel, evt.direction_type
+        )
+
+        # 当前总质量
+        m_total = parent.state[6]
+        m_sat = evt.mass
+        m_parent_new = m_total - m_sat
+
+        if m_total <= 0:
+            return
+
+        # 动量守恒分配速度
+        dv_sat = v_rel_vec * (m_parent_new / m_total)
+        dv_parent = -v_rel_vec * (m_sat / m_total)
+
+        # 2. 生成子卫星 (应用 dv_sat)
+        self._spawn_object(
+            parent=parent,
+            mass=m_sat,
+            name=evt.name,
+            obj_type=OBJ_TYPE_SAT,
+            drag_area=0.5,
+            velocity_offset=dv_sat,  # _spawn_object 内部会叠加到 parent.v 上
+        )
+
+        # 3. 更新母体状态 (应用反冲)
+        parent.state[0:3] += dv_parent * 0.001  # 位置微调防重叠
+        parent.state[3:6] += dv_parent  # 速度应用反冲
+        parent.state[6] = m_parent_new  # 质量更新
+
+        print(
+            f"Event: {parent.name} deployed {evt.name} (Recoil dV: {np.linalg.norm(dv_parent):.4f} m/s)"
+        )
+
+    def _calculate_separation_velocity(
+        self, parent: TrackedObject, speed: float, mode: int
+    ) -> np.ndarray:
+        if speed <= 0:
+            return np.zeros(3)
+
+        # 获取母体姿态基向量
+        v = parent.state[3:6]
+        r = parent.state[0:3]
+
+        prograde = (
+            v / np.linalg.norm(v) if np.linalg.norm(v) > 0 else np.array([1, 0, 0])
+        )
+
+        if mode == 0:  # Prograde
+            return prograde * speed
+        elif mode == 3:  # Random
+            # 简单随机
+            rnd = np.random.normal(size=3)
+            rnd /= np.linalg.norm(rnd)
+            return rnd * speed
+
+        return np.zeros(3)
 
     def _record_all_states(self):
         # 遍历所有物体并记录
@@ -891,26 +1660,96 @@ class RocketSimulator3D:
                 downrange = angle * R_EARTH
             else:
                 downrange = 0.0
+            hist = {
+                "Time": round(self.time, 3),
+                "Object": obj.name,
+                "Type": obj.obj_type,
+                "Downrange": downrange,
+                "Altitude": alt,
+                "Velocity": v_mag_rel,
+                "InertialVelocity": v_mag_inertial,
+                "SpecificEnergy": spec_energy,
+                "TotalEnergy": total_energy,
+                "Mass": m,
+                "Latitude": lat,
+                "Longitude": lon,
+            }
+            if obj.obj_type == OBJ_TYPE_SAT:
+                kep = calculate_kepler_elements(r, v)
+                # 如果是双曲线轨道(e>1)或者处于大气层深处，a可能为负或无意义
+                orbit_a_km = kep[0]
+                orbit_e = kep[1]
+                orbit_i = kep[2]
+                orbit_period = kep[6]
+
+                # 近地点/远地点高度估算 (椭圆轨道时有效)
+                if orbit_e < 1.0 and orbit_a_km > 0:
+                    apoapsis_km = orbit_a_km * (1 + orbit_e) - R_EARTH / 1000.0
+                    periapsis_km = orbit_a_km * (1 - orbit_e) - R_EARTH / 1000.0
+                else:
+                    apoapsis_km = 0.0
+                    periapsis_km = 0.0
+                kep_hist = {
+                    "Orbit_a_km": orbit_a_km,
+                    "Orbit_e": orbit_e,
+                    "Orbit_i": orbit_i,
+                    "Orbit_Peri_km": periapsis_km,
+                    "Orbit_Apo_km": apoapsis_km,
+                    "Orbit_T_min": orbit_period,
+                    "Orbit_RAAN": kep[3],
+                    "Orbit_ArgP": kep[4],
+                    "Orbit_Nu": kep[5],
+                }
+                hist.update(kep_hist)
 
             # 记录数据
-            obj.history.append(
-                {
-                    "Time": round(self.time, 3),
-                    "Object": obj.name,
-                    "Type": obj.obj_type,
-                    "Downrange": downrange,
-                    "Altitude": alt,
-                    "Velocity": v_mag_rel,
-                    "InertialVelocity": v_mag_inertial,
-                    "SpecificEnergy": spec_energy,
-                    "TotalEnergy": total_energy,
-                    "Mass": m,
-                    "Latitude": lat,
-                    "Longitude": lon,
-                }
+            obj.history.append(hist)
+
+    def _handle_fairing_separation(self, rocket: TrackedObject, t: float):
+        if not self.fairing_separated and t >= self.cfg.fairing_sep_time:
+            self.fairing_separated = True
+
+            # 1. 物理属性变更
+            f_mass = self.cfg.fairing_mass
+            rocket.state[6] -= f_mass  # 减重
+
+            rocket.drag_coeff_type = 1  # 切换为 Fixed Cd
+            rocket.fixed_cd = 0.8  # 钝体载荷的典型值
+            # 减小一点主火箭迎风面积
+            rocket.drag_area *= 0.8
+
+            print(f"Event: Fairing Separation at t={t:.2f}s (Mass -{f_mass}kg)")
+
+            # 2. 生成碎片 (两瓣整流罩)
+            # 给定一个侧向分离速度
+            v_sep = 2.0  # m/s
+
+            # 左半瓣
+            self._spawn_object(
+                parent=rocket,
+                mass=f_mass / 2.0,
+                name="Fairing Half A",
+                obj_type=OBJ_TYPE_STAGE,  # 视为碎片
+                drag_area=rocket.drag_area / 2.0,  # 碎片阻力面积较大
+                velocity_offset=self._calculate_separation_velocity(
+                    rocket, v_sep, 3
+                ),  # 随机/侧向方向
+            )
+
+            # 右半瓣
+            self._spawn_object(
+                parent=rocket,
+                mass=f_mass / 2.0,
+                name="Fairing Half B",
+                obj_type=OBJ_TYPE_STAGE,
+                drag_area=rocket.drag_area / 2.0,
+                velocity_offset=self._calculate_separation_velocity(rocket, v_sep, 3),
             )
 
     def export_csv(self):
+        """导出所有物体的轨迹到不同的文件"""
+        import os
+
         # 按物体名称分组导出
         for obj in self.objects:
             if not obj.history:
@@ -931,48 +1770,312 @@ class RocketSimulator3D:
                 print(f"Failed to export {obj.name}: {e}")
 
     def plot(self):
-        fig = plt.figure(figsize=(14, 6))
+        # 1. 极简边距设置
+        plt.style.use("seaborn-v0_8-darkgrid")
+        fig = plt.figure(figsize=(20, 10), constrained_layout=True)
+        fig.suptitle(
+            f"Orbit & Trajectory Dashboard (T={self.time:.1f}s)",
+            fontsize=16,
+            weight="bold",
+        )
 
-        # 图1: 高度 vs 时间
-        ax1 = fig.add_subplot(1, 2, 1)
-        for obj in self.objects:
+        # 2. 定义 2x3 网格
+        gs = gridspec.GridSpec(2, 3, figure=fig, height_ratios=[1, 1.2])
+
+        # Row 1: 数据分析
+        ax_prof = fig.add_subplot(gs[0, 0])
+        ax_vel = fig.add_subplot(gs[0, 1])
+        ax_orb = fig.add_subplot(gs[0, 2])
+
+        # Row 2: 空间可视化
+        ax_map = fig.add_subplot(gs[1, 0])
+        ax_ecef = fig.add_subplot(gs[1, 1], projection="3d")
+        ax_eci = fig.add_subplot(gs[1, 2], projection="3d")
+
+        # 颜色生成
+        colors = plt.cm.jet(np.linspace(0, 1, len(self.objects)))
+
+        # 范围记录
+        max_range_ecef = R_EARTH / 1000.0
+        max_range_eci = R_EARTH / 1000.0
+
+        print("Generating 6-Panel Analysis...")
+
+        for idx, obj in enumerate(self.objects):
             if not obj.history:
                 continue
-            times = [h["Time"] for h in obj.history]
-            alts = [h["Altitude"] / 1000 for h in obj.history]  # km
-            ax1.plot(times, alts, label=obj.name)
 
-        ax1.set_xlabel("Time (s)")
-        ax1.set_ylabel("Altitude (km)")
-        ax1.set_title("Altitude Profile")
-        ax1.legend()
-        ax1.grid(True)
+            # --- 数据准备 ---
+            hist = obj.history
+            times = np.array([h["Time"] for h in hist])
 
-        # 图2: 3D 轨迹 (ECEF) - 简单示意
-        ax2 = fig.add_subplot(1, 2, 2, projection="3d")
-        # 画个地球
-        u, v = np.mgrid[0 : 2 * np.pi : 20j, 0 : np.pi : 10j]
-        x = R_EARTH / 1000 * np.cos(u) * np.sin(v)
-        y = R_EARTH / 1000 * np.sin(u) * np.sin(v)
-        z = R_EARTH / 1000 * np.cos(v)
-        ax2.plot_wireframe(x, y, z, color="gray", alpha=0.3)
+            # 降采样
+            step = max(1, len(times) // 1200)
 
-        for obj in self.objects:
-            # 抽样画图，防止卡顿
-            hist = obj.history[::10]
-            lats = np.radians([h["Latitude"] for h in hist])
-            lons = np.radians([h["Longitude"] for h in hist])
-            alts = np.array([h["Altitude"] for h in hist])
+            # 基础数据
+            t_plot = times[::step]
+            alt = np.array([h["Altitude"] for h in hist])[::step] / 1000.0
+            dr = np.array([h["Downrange"] for h in hist])[::step] / 1000.0
+            v_inertial = np.array([h["InertialVelocity"] for h in hist])[::step]
+            lats = np.array([h["Latitude"] for h in hist])[::step]
+            lons = np.array([h["Longitude"] for h in hist])[::step]
 
-            # 简易 LLA 转直角坐标画图
-            r = (R_EARTH + alts) / 1000
-            X = r * np.cos(lats) * np.cos(lons)
-            Y = r * np.cos(lats) * np.sin(lons)
-            Z = r * np.sin(lats)
+            color = colors[idx]
+            label = obj.name
 
-            ax2.plot(X, Y, Z, label=obj.name)
+            # [Plot 1] Flight Profile
+            ax_prof.plot(dr, alt, label=label, color=color, linewidth=1.5)
 
-        ax2.set_title("3D Trajectory (ECEF-ish)")
+            # [Plot 2] Velocity
+            ax_vel.plot(t_plot, v_inertial, label=label, color=color)
 
-        plt.tight_layout()
+            # [Plot 3] Orbit Evolution (Apogee/Perigee History)
+            # 需要重新计算每一步的瞬时轨道根数 只有当高度较高且速度够快时才计算，避免发射台附近的奇异值
+            valid_mask = (alt > 50) & (v_inertial > 1000)
+            if np.any(valid_mask):
+                t_valid = t_plot[valid_mask]
+                r_mag = (alt[valid_mask] * 1000.0) + R_EARTH  # m
+                v_mag = v_inertial[valid_mask]  # m/s
+
+                # 活力公式 (Vis-Viva) 估算半长轴 a
+                # E = v^2/2 - mu/r = -mu/2a  =>  1/a = 2/r - v^2/mu
+                inv_a = (2.0 / r_mag) - (v_mag**2 / GM)
+
+                # 筛选椭圆轨道 (inv_a > 0)
+                ellipse_mask = inv_a > 1e-9
+                if np.any(ellipse_mask):
+                    t_ell = t_valid[ellipse_mask]
+                    a = 1.0 / inv_a[ellipse_mask]  # m
+
+                    # 半长轴高度代表轨道能量
+                    sma_km = (a / 1000.0) - (R_EARTH / 1000.0)
+
+                    # 绘制半长轴高度 (代表轨道总能量)
+                    ax_orb.plot(
+                        t_ell,
+                        sma_km,
+                        color=color,
+                        linestyle="-",
+                        linewidth=1.5,
+                        alpha=0.8,
+                    )
+
+            # [Plot 4] Ground Track
+            ax_map.plot(lons, lats, color=color, linewidth=1.2)
+            ax_map.scatter(lons[-1], lats[-1], color=color, s=15, marker="x")
+
+            # --- 3D 坐标转换 ---
+            r_m = (alt * 1000.0) + R_EARTH
+            lat_r = np.radians(lats)
+            lon_r = np.radians(lons)
+
+            x_ecef = r_m * np.cos(lat_r) * np.cos(lon_r) / 1000.0
+            y_ecef = r_m * np.cos(lat_r) * np.sin(lon_r) / 1000.0
+            z_ecef = r_m * np.sin(lat_r) / 1000.0
+
+            # ECI 转换
+            theta = OMEGA_E * t_plot
+            c, s = np.cos(theta), np.sin(theta)
+            x_eci = x_ecef * c - y_ecef * s
+            y_eci = x_ecef * s + y_ecef * c
+            z_eci = z_ecef
+
+            # [Plot 5] ECEF 3D
+            ax_ecef.plot(x_ecef, y_ecef, z_ecef, color=color, linewidth=1)
+            if np.max(np.abs(x_ecef)) > max_range_ecef:
+                max_range_ecef = np.max(np.abs(x_ecef))
+
+            # [Plot 6] ECI 3D
+            ax_eci.plot(x_eci, y_eci, z_eci, color=color, linewidth=1, label=label)
+            if np.max(np.abs(x_eci)) > max_range_eci:
+                max_range_eci = np.max(np.abs(x_eci))
+
+        # --- 图表装饰 ---
+
+        # 1. Profile
+        ax_prof.set_title("1. Flight Profile", fontsize=10, weight="bold")
+        ax_prof.set_ylabel("Alt (km)")
+        ax_prof.set_xlabel("Downrange (km)")
+
+        # 2. Velocity
+        ax_vel.set_title("2. Inertial Velocity", fontsize=10, weight="bold")
+        ax_vel.set_ylabel("V (m/s)")
+        ax_vel.axhline(7800, color="grey", ls=":", alpha=0.5)
+
+        # 3. Orbit Energy (SMA)
+        ax_orb.set_title(
+            "3. Orbital Energy (Semi-Major Axis Alt)", fontsize=10, weight="bold"
+        )
+        ax_orb.set_ylabel("SMA Altitude (km)")
+        ax_orb.set_xlabel("Time (s)")
+        ax_orb.set_ylim(bottom=-R_EARTH / 1000.0)  # 允许显示负值(亚轨道)
+        ax_orb.grid(True, which="both", alpha=0.3)
+        ax_orb.text(
+            0.05,
+            0.9,
+            "Height > 0 means Orbit capable",
+            transform=ax_orb.transAxes,
+            fontsize=8,
+            color="green",
+        )
+
+        # 4. Map
+        ax_map.set_title("4. Ground Track", fontsize=10, weight="bold")
+        ax_map.set_xlim(-180, 180)
+        ax_map.set_ylim(-90, 90)
+        ax_map.set_aspect("equal")
+        ax_map.grid(True, ls=":")
+
+        # Common 3D Setup
+        def setup_3d(ax, title, limit):
+            ax.set_title(title, fontsize=10, weight="bold")
+            # Wireframe Earth
+            u, v = np.mgrid[0 : 2 * np.pi : 20j, 0 : np.pi : 10j]
+            Re = R_EARTH / 1000.0
+            x = Re * np.cos(u) * np.sin(v)
+            y = Re * np.sin(u) * np.sin(v)
+            z = Re * np.cos(v)
+            ax.plot_wireframe(x, y, z, color="gray", alpha=0.1, lw=0.5)
+            # Aspect Ratio
+            lim = max(limit, Re * 1.2)
+            ax.set_xlim(-lim, lim)
+            ax.set_ylim(-lim, lim)
+            ax.set_zlim(-lim, lim)
+            # Remove pane color for cleaner look
+            ax.xaxis.pane.fill = False
+            ax.yaxis.pane.fill = False
+            ax.zaxis.pane.fill = False
+            ax.grid(False)  # Clean grid
+
+        # 5. ECEF
+        setup_3d(ax_ecef, "5. ECEF (Rotating Frame)", max_range_ecef)
+
+        # 6. ECI
+        setup_3d(ax_eci, "6. ECI (Inertial Frame)", max_range_eci)
+
+        # Legend
+        ax_eci.legend(loc="upper right", fontsize="xx-small")
+
         plt.show()
+
+
+if __name__ == "__main__":
+    # ==========================================
+    # 仿真配置：基于 "Electron-ish" 轻型火箭参数
+    # ==========================================
+
+    # --- 1. 定义火箭各级 (Rocket Stages) ---
+    # 第一级: 类似于 Rutherford x9
+    # TWR ~ 1.5, 海平面推力受背压影响
+    stage_1 = RocketStage(
+        fuel_mass=11350.0,  # kg
+        dry_mass=950.0,  # kg
+        isp=311.0,  # s (真空ISP，海平面会有损失)
+        thrust=192000.0,  # N (名义推力/真空推力)
+        nozzle_area=0.35,  # m^2 (用于计算大气背压推力损失)
+    )
+
+    # 第二级: 类似于 Rutherford Vacuum
+    # TWR < 1.0, 真空环境
+    stage_2 = RocketStage(
+        fuel_mass=2050.0,
+        dry_mass=250.0,
+        isp=343.0,
+        thrust=25000.0,  # N
+        nozzle_area=0.0,  # 上面级设为0，避免被错误地减去背压
+    )
+
+    # --- 2. 定义载荷与 Kick Stage ---
+    # 定义星座释放计划：释放 5 颗 10kg 的卫星
+    constellation_plan = SubSatelliteConfig(
+        name_pattern="Sat_Mini_{i}",
+        count=5,
+        mass=10.0,  # 单颗质量
+        release_start_time=20.0,  # 入轨/KickStage燃尽后20秒开始
+        release_interval=15.0,  # 每15秒释放一颗
+        separation_velocity=1.2,  # 弹簧分离速度 m/s
+    )
+
+    # 定义 Kick Stage (上面级/分配器)
+    # 类似于 Curie Engine
+    kick_stage_conf = KickStageConfig(
+        enabled=True,
+        dry_mass=40.0,
+        fuel_mass=65.0,  # 增加一点总燃料 (入轨需要约40-50kg)
+        thrust=1200.0,
+        isp=320.0,
+        # === 开启自毁模式 ===
+        deorbit_enabled=True,
+        deorbit_fuel_mass=20.0,  # 留 15kg 用于反推
+        deorbit_delay=300.0,  # 最后一颗卫星走后 300秒 再自毁
+        # ===================
+        payloads=[constellation_plan],
+    )
+
+    # --- 3. 组装 SimConfig ---
+    config = SimConfig(
+        stages=[stage_1, stage_2],
+        payload_mass=150.0,  # 有效载荷总重 (卫星+分配器+KickStage燃料)
+        rocket_diameter=1.2,  # 直径 (m)
+        nosecone_type="Ogive",  # 鼻锥类型
+        nosecone_ld_ratio=4.0,  # 长细比
+        reentry_diameter=1.2,
+        fairing_mass=50.0,
+        fairing_sep_time=185.0,
+        # 气动尾翼 (电子号没有，设为0)
+        fins=FinConfig(0, 0, 0, 0, 0, 0),
+        # 发射场: 新西兰 Mahia (近似)
+        launch_lat=-39.26,
+        launch_lon=177.86,
+        launch_azimuth=90.0,  # 向正东发射，利用地球自转
+        # 制导律参数
+        vertical_time=12.0,  # 垂直爬升12秒避开回转塔
+        pitch_over_angle=3.0,  # 初始转弯角度 3 度
+        guidance_aoa=0.0,  # 零攻角重力转弯
+        kick_stage=kick_stage_conf,
+    )
+
+    # --- 4. 运行仿真 ---
+    print("Initialize Simulation...")
+    sim = RocketSimulator3D(config)
+
+    print("\n--- Mission Start ---")
+    # 运行足够长的时间以覆盖入轨和卫星释放
+    # 步长自适应，不用担心时间过长
+    sim.run_adaptive(max_dt=5.0)
+
+    print("\n--- Mission Complete ---")
+
+    # --- 5. 简单的结果分析 ---
+    # 查找主载荷或 KickStage
+    kicker = next((o for o in sim.objects if "Dispenser" in o.name), None)
+
+    if kicker and kicker.history:
+        last_state = kicker.history[-1]
+        print(f"\n[Orbit Status - {kicker.name}]")
+        print(f"Altitude: {last_state['Altitude']/1000:.2f} km")
+        print(f"Velocity: {last_state['InertialVelocity']:.2f} m/s")
+
+        # 如果有轨道根数记录
+        if "Orbit_a_km" in last_state:
+            print(
+                f"Orbit: {last_state['Orbit_Peri_km']:.1f} km x {last_state['Orbit_Apo_km']:.1f} km"
+            )
+            print(f"Inclination: {last_state['Orbit_i']:.2f} deg")
+
+    # 统计释放的卫星
+    sats = [o for o in sim.objects if o.obj_type == OBJ_TYPE_SAT]
+    print(f"\n[Deployment] Deployed {len(sats)} satellites.")
+    for s in sats:
+        if s.history:
+            h = s.history[-1]
+            print(
+                f" - {s.name}: H={h['Altitude']/1000:.1f}km, V={h['InertialVelocity']:.1f}m/s"
+            )
+            if "Orbit_a_km" in h:
+                print(
+                    f"\tperiapsis {h['Orbit_Peri_km']:.1f} km apoapsis {h['Orbit_Apo_km']:.1f} km inclination: {h['Orbit_i']:.2f} deg"
+                )
+    # --- 6. 绘图 ---
+    sim.plot()
+    # sim.export_csv()
