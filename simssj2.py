@@ -612,7 +612,7 @@ class Simulation(object):
                BCONIC = 1/(0.054882+0.363845*ld)
                cd = MCONIC*mach+BCONIC
             elif mach <1.05:
-               cd = 0.075*ld + 0.275
+               cd = -0.075*ld + 0.275
 
         if (self.Nosecone == 'tangent ogive'): # assume that both nosecone shapes give same shape
             if mach >= 1.2: # All values taken from fits to HyperCFD
