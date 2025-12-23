@@ -246,7 +246,7 @@ def get_nc_type_id(name: str) -> int:
 
 
 @njit(cache=True)
-def lla_to_ecef_numba(lat: float, lon: float, alt: float) -> np.ndarray:
+def lla_to_ecef(lat: float, lon: float, alt: float) -> np.ndarray:
     lat_rad = np.radians(lat)
     lon_rad = np.radians(lon)
     a = R_EARTH
@@ -260,7 +260,7 @@ def lla_to_ecef_numba(lat: float, lon: float, alt: float) -> np.ndarray:
 
 
 @njit(cache=True)
-def eci_to_lla_numba(r_eci: np.ndarray, time: float) -> tuple:
+def eci_to_lla(r_eci: np.ndarray, time: float) -> tuple:
     # 旋转 ECI 到 ECEF
     theta = OMEGA_E * time
     cos_t, sin_t = np.cos(theta), np.sin(theta)
@@ -292,12 +292,12 @@ def eci_to_lla_numba(r_eci: np.ndarray, time: float) -> tuple:
 
 
 @njit(cache=True)
-def atmosphere_numba(altitude_m: float) -> tuple:
+def atmosphere(altitude_m: float) -> tuple:
     if altitude_m < 0:
         altitude_m = 0
 
-    # Part 1: < 84.852km
-    if altitude_m < 84852.0:
+    # Part 1: < 86km
+    if altitude_m < 86000.0:
         g0 = 9.80665
         R = 287.05287
         R_earth = 6356766.0
@@ -536,7 +536,7 @@ def estimate_time_to_apoapsis(r_vec: np.ndarray, v_vec: np.ndarray) -> float:
 
 
 @njit(cache=True)
-def get_cd_numba(
+def get_cd(
     mach: float,
     h: float,
     velocity: float,
@@ -568,7 +568,7 @@ def get_cd_numba(
         afep = 0.5 * (cr_m + ct_m) * fh
         afp = afep + 0.5 * cr_m * rocket_diam
 
-        rho, _, _ = atmosphere_numba(h)
+        rho, _, _ = atmosphere(h)
         mu = 1.789e-5
         reynolds = rho * velocity * lflm / mu
         if reynolds <= 1.0:
@@ -686,7 +686,7 @@ def get_cd_numba(
 
 
 @njit(cache=True)
-def calculate_gravity_numba(r_vec: np.ndarray) -> np.ndarray:
+def calculate_gravity(r_vec: np.ndarray) -> np.ndarray:
     r_mag = np.linalg.norm(r_vec)
     if r_mag == 0:
         return np.zeros(3)
@@ -725,8 +725,8 @@ def physics_kernel(
     nc_ld = geo_params[3]
 
     # 1. Environment
-    _, _, altitude = eci_to_lla_numba(r, t)
-    rho, temp_k, pressure = atmosphere_numba(altitude)
+    _, _, altitude = eci_to_lla(r, t)
+    rho, temp_k, pressure = atmosphere(altitude)
     c_sound = np.sqrt(1.4 * 287.0 * temp_k) if temp_k > 0 else 300.0
 
     # 2. Relative Velocity
@@ -868,7 +868,7 @@ def physics_kernel(
     if use_fixed_cd:
         cd = fixed_cd_val
     else:
-        cd = get_cd_numba(
+        cd = get_cd(
             mach.item(),
             altitude,
             v_rel_mag.item(),
@@ -906,7 +906,7 @@ def physics_kernel(
             lift_dir /= ld_norm
             f_lift = f_lift_mag * lift_dir
 
-    f_gravity = calculate_gravity_numba(r) * m
+    f_gravity = calculate_gravity(r) * m
 
     f_total = f_thrust + f_drag + f_lift + f_gravity
 
@@ -1036,7 +1036,7 @@ class RocketSimulator3D:
         self.objects.append(main_rocket)
 
     def _get_initial_state(self):
-        r_ecef = lla_to_ecef_numba(self.cfg.launch_lat, self.cfg.launch_lon, 5.0)
+        r_ecef = lla_to_ecef(self.cfg.launch_lat, self.cfg.launch_lon, 5.0)
         omega_vec = np.array([0, 0, OMEGA_E])
         v_rot = np.cross(omega_vec, r_ecef)
         return r_ecef, v_rot
@@ -1227,7 +1227,7 @@ class RocketSimulator3D:
                 # 对所有活跃物体计算 RK45
                 for obj in active_objs:
                     # 使用精确的海拔计算
-                    lat, lon, altitude = eci_to_lla_numba(obj.state[0:3], t)
+                    lat, lon, altitude = eci_to_lla(obj.state[0:3], t)
 
                     # 计算径向速度，用于判断是否在下降
                     v_rad = 0.0
@@ -1630,7 +1630,7 @@ class RocketSimulator3D:
             v = obj.state[3:6]
             m = obj.state[6]
 
-            lat, lon, alt = eci_to_lla_numba(r, self.time)
+            lat, lon, alt = eci_to_lla(r, self.time)
 
             # --- 速度计算 ---
             omega_vec = np.array([0, 0, OMEGA_E])
@@ -1647,8 +1647,8 @@ class RocketSimulator3D:
             total_energy = spec_energy * m
 
             # --- 射程计算 ---
-            r0 = lla_to_ecef_numba(self.cfg.launch_lat, self.cfg.launch_lon, 0)
-            curr_ecef = lla_to_ecef_numba(lat, lon, 0)
+            r0 = lla_to_ecef(self.cfg.launch_lat, self.cfg.launch_lon, 0)
+            curr_ecef = lla_to_ecef(lat, lon, 0)
 
             n_r0 = np.linalg.norm(r0)
             n_curr = np.linalg.norm(curr_ecef)
