@@ -187,7 +187,7 @@ class RocketStage:
     fuel_mass: float  # kg
     dry_mass: float  # kg
     isp: float  # s
-    thrust: float  # N 推力，第一级是海平面 / 其他真空
+    thrust: float  # N 真空推力
 
     nozzle_area: float = 0.0
     burn_time: float = 0.0
@@ -745,15 +745,18 @@ def physics_kernel(
     for i in range(stage_matrix.shape[0]):
         # 增加质量检查：如果质量已经极小(燃料耗尽)，不再产生推力
         if stage_matrix[i, 2] <= t < stage_matrix[i, 3]:
-            # 只有当仍有足够质量时才产生推力（假设空重至少 > 1kg）
+            # 只有当仍有足够质量时才产生推力
             if m > 1.0:
-                thrust_raw = stage_matrix[i, 0]
+                thrust_vac = stage_matrix[i, 0]
                 dmdt_val = stage_matrix[i, 1]
-                stage_area = stage_matrix[i, 4]  # 从矩阵读取当前级的面积
-                # 大气内压力修正
-                # 如果是主火箭第一级，nozzle_area 会很大，产生显著修正
-                # 如果是上面级或卫星，nozzle_area 应为 0 (在构造时处理)
-                thrust_val = thrust_raw + stage_area * (101325.0 - pressure)
+                stage_area = stage_matrix[i, 4] 
+                
+                # F_actual = F_vac - A_exit * P_ambient
+                thrust_val = thrust_vac - stage_area * pressure
+
+                if thrust_val < 0:
+                    thrust_val = 0.0
+                    
                 is_burning = True
             break
 
@@ -1965,24 +1968,24 @@ if __name__ == "__main__":
     # ==========================================
 
     # --- 1. 定义火箭各级 (Rocket Stages) ---
-    # 第一级: 类似于 Rutherford x9
-    # TWR ~ 1.5, 海平面推力受背压影响
+    # 第一级: Rutherford x9
+    # Electron 真实数据参考：真空推力 ~224kN，海平面 ~190kN，真空比冲 ~311s
     stage_1 = RocketStage(
-        fuel_mass=11350.0,  # kg
-        dry_mass=950.0,  # kg
-        isp=311.0,  # s (真空ISP，海平面会有损失)
-        thrust=192000.0,  # N (名义推力/真空推力)
-        nozzle_area=0.35,  # m^2 (用于计算大气背压推力损失)
+        fuel_mass=11350.0,
+        dry_mass=950.0,
+        isp=311.0,         # 真空比冲
+        thrust=224000.0,   # 输入真空推力
+        # 计算喷管面积：(F_vac - F_sl) / P_sl = (224000 - 190000) / 101325 ≈ 0.335
+        nozzle_area=0.335, # 调整面积以获得正确的海平面推力
     )
 
-    # 第二级: 类似于 Rutherford Vacuum
-    # TWR < 1.0, 真空环境
+    # 第二级: Rutherford Vacuum
     stage_2 = RocketStage(
         fuel_mass=2050.0,
         dry_mass=250.0,
         isp=343.0,
-        thrust=25000.0,  # N
-        nozzle_area=0.0,  # 上面级设为0，避免被错误地减去背压
+        thrust=25800.0,    # 真空推力 (Electron 二级约为 25.8kN)
+        nozzle_area=0.8,   # 真空发动机喷管其实很大，但在高空 pressure≈0，这项影响很小
     )
 
     # --- 2. 定义载荷与 Kick Stage ---
@@ -1990,7 +1993,7 @@ if __name__ == "__main__":
     constellation_plan = SubSatelliteConfig(
         name_pattern="Sat_Mini_{i}",
         count=5,
-        mass=10.0,  # 单颗质量
+        mass=40.0,  # 单颗质量
         release_start_time=20.0,  # 入轨/KickStage燃尽后20秒开始
         release_interval=15.0,  # 每15秒释放一颗
         separation_velocity=1.2,  # 弹簧分离速度 m/s
@@ -2001,8 +2004,8 @@ if __name__ == "__main__":
     kick_stage_conf = KickStageConfig(
         enabled=True,
         dry_mass=40.0,
-        fuel_mass=65.0,  # 增加一点总燃料 (入轨需要约40-50kg)
-        thrust=1200.0,
+        fuel_mass=50.0,  # 增加一点总燃料 (入轨需要约40-50kg)
+        thrust=120.0,
         isp=320.0,
         # === 开启自毁模式 ===
         deorbit_enabled=True,
@@ -2015,7 +2018,7 @@ if __name__ == "__main__":
     # --- 3. 组装 SimConfig ---
     config = SimConfig(
         stages=[stage_1, stage_2],
-        payload_mass=150.0,  # 有效载荷总重 (卫星+分配器+KickStage燃料)
+        payload_mass=290.0,  # 有效载荷总重 (卫星+分配器+KickStage燃料)
         rocket_diameter=1.2,  # 直径 (m)
         nosecone_type="Ogive",  # 鼻锥类型
         nosecone_ld_ratio=4.0,  # 长细比
@@ -2030,7 +2033,7 @@ if __name__ == "__main__":
         launch_azimuth=90.0,  # 向正东发射，利用地球自转
         # 制导律参数
         vertical_time=12.0,  # 垂直爬升12秒避开回转塔
-        pitch_over_angle=3.0,  # 初始转弯角度 3 度
+        pitch_over_angle=5.0,  # 初始转弯角度 3 度
         guidance_aoa=0.0,  # 零攻角重力转弯
         kick_stage=kick_stage_conf,
     )
